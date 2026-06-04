@@ -35,7 +35,7 @@ export function getSupabase(): SupabaseClient {
             await chrome.storage.local.remove(key);
           },
         },
-        autoRefreshToken: true,
+        autoRefreshToken: false,
         persistSession: true,
       },
     });

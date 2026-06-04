@@ -67,7 +67,7 @@ export async function authenticateLicense(licenseKey: string) {
   if (data.access_token) {
     await supabase.auth.setSession({
       access_token: data.access_token,
-      refresh_token: data.access_token,
+      refresh_token: "", // Provide empty string or valid token, though Supabase requires it for setSession.
     });
     await setSecureLicense(licenseKey);
     return true;
