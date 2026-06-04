@@ -50,59 +50,38 @@ export async function scrapeAdobeStock(
     const encodedKeyword = encodeURIComponent(keyword);
 
     // ── Strategy 1: AJAX JSON endpoint ──────────────
-    const ajaxUrl =
-      `${ADOBE_STOCK_BASE}/Ajax/Search?k=${encodedKeyword}&${filterParams}&get_facets_only=1`;
+    try {
+      const ajaxUrl = `${ADOBE_STOCK_BASE}/Ajax/Search?k=${encodedKeyword}&${filterParams}&get_facets_only=1`;
+      const response = await fetch(ajaxUrl, {
+        method: "GET",
+        credentials: "omit",
+        headers: {
+          "Accept": "application/json, text/javascript, */*; q=0.01",
+          "Accept-Language": "en-US,en;q=0.9",
+          "X-Requested-With": "XMLHttpRequest",
+          "Referer": `${ADOBE_STOCK_BASE}/search?k=${encodedKeyword}`,
+          "Sec-Fetch-Dest": "empty",
+          "Sec-Fetch-Mode": "cors",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      });
 
-    const response = await fetch(ajaxUrl, {
-      method: "GET",
-      credentials: "omit",
-      headers: {
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": `${ADOBE_STOCK_BASE}/search?k=${encodedKeyword}`,
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-      },
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-
-      // Adobe returns total in different fields depending on endpoint version
-      const total = data.total ?? data.nb_results ?? data.totalResults;
-
-      if (typeof total === "number") {
-        return { topic: keyword, demand: total, status: "ok" };
+      if (response.ok) {
+        const data = await response.json();
+        const total = data.total ?? data.nb_results ?? data.totalResults;
+        if (typeof total === "number") {
+          return { topic: keyword, demand: total, status: "ok" };
+        }
       }
-
-      // If JSON came back but without a recognizable count field
-      console.warn(`[Scraper] AJAX response for "${keyword}" missing total field:`, Object.keys(data));
+    } catch (ajaxErr) {
+      console.warn(`[Scraper] AJAX strategy failed for "${keyword}", falling back to HTML:`, ajaxErr);
     }
 
     // ── Strategy 2: HTML fallback ───────────────────
-    if (response.status === 403 || response.status === 429) {
-      return {
-        topic: keyword,
-        demand: null,
-        status: "waf_blocked",
-      };
-    }
-
     return await scrapeHtmlFallback(keyword, filters);
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
     const isCORS = err.message.includes("Failed to fetch") || err.message.includes("NetworkError");
-
-    console.error(`[Scraper] ❌ Error for "${keyword}":`, {
-      message: err.message,
-      type: isCORS ? "CORS / Network blocked" : "Runtime error",
-      hint: isCORS
-        ? "Check manifest.json host_permissions — needs *://*.adobe.com/*"
-        : "Unexpected error in scraper logic",
-      error: err,
-    });
 
     return {
       topic: keyword,
@@ -146,7 +125,6 @@ async function scrapeHtmlFallback(
 
     const html = await response.text();
 
-    // Multiple regex strategies for extracting the count
     const patterns = [
       /"nb_results"\s*:\s*(\d+)/,
       /"total"\s*:\s*(\d+)/,
@@ -154,12 +132,19 @@ async function scrapeHtmlFallback(
       /(\d[\d,]+)\s+results?\s+found/i,
       /Showing\s+\d+[-–]\d+\s+of\s+([\d,]+)/i,
       /"totalResults"\s*:\s*(\d+)/,
+      /(\d[\d,]+)\s+assets?\s+found/i,
+      /"count"\s*:\s*(\d+)/,
+      /data-test-id="search-results-count"[^>]*>([^<]+)</,
+      /aria-label="([\d,]+) results"/i,
+      /aria-label="([\d,]+) images"/i,
     ];
 
     for (const pattern of patterns) {
       const match = html.match(pattern);
       if (match?.[1]) {
-        const count = parseInt(match[1].replace(/,/g, ""), 10);
+        // For the data-test-id match, it might contain text like "10,000 results", so extract digits
+        const digitsOnly = match[1].replace(/[^\d]/g, "");
+        const count = parseInt(digitsOnly, 10);
         if (!isNaN(count)) {
           return { topic: keyword, demand: count, status: "ok" };
         }
