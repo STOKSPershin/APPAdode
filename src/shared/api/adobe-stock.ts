@@ -54,15 +54,11 @@ export async function scrapeAdobeStock(
       const ajaxUrl = `${ADOBE_STOCK_BASE}/Ajax/Search?k=${encodedKeyword}&${filterParams}&get_facets_only=1`;
       const response = await fetch(ajaxUrl, {
         method: "GET",
-        credentials: "omit",
+        credentials: "include",
         headers: {
           "Accept": "application/json, text/javascript, */*; q=0.01",
           "Accept-Language": "en-US,en;q=0.9",
           "X-Requested-With": "XMLHttpRequest",
-          "Referer": `${ADOBE_STOCK_BASE}/search?k=${encodedKeyword}`,
-          "Sec-Fetch-Dest": "empty",
-          "Sec-Fetch-Mode": "cors",
-          "Sec-Fetch-Site": "same-origin",
         },
       });
 
@@ -104,14 +100,10 @@ async function scrapeHtmlFallback(
 
     const response = await fetch(url, {
       method: "GET",
-      credentials: "omit",
+      credentials: "include",
       headers: {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
       },
     });
 

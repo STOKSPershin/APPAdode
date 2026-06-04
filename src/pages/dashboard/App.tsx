@@ -86,6 +86,7 @@ export default function App() {
             const max = payload.maxResults ?? Infinity;
             
             const filteredResults = payload.results.filter(r => {
+              if (r.status !== "ok") return true;
               if (r.demand === null) return false;
               return r.demand >= min && r.demand <= max;
             });
