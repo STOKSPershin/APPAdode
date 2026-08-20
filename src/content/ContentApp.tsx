@@ -1,11 +1,44 @@
-import { useState, useEffect, useCallback } from "react";
-import { AVAILABLE_MODELS, CONTENT_FILTERS, type ContentFilter } from "@shared/types";
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  AVAILABLE_MODELS,
+  CONTENT_FILTERS,
+  type ContentFilter,
+  type ScanPayload,
+} from "@shared/types";
 import { generateTopics } from "@shared/api/openai";
-import { scrapeAdobeStock, processTopicsWithDelay, checkSanity } from "@shared/api/adobe-stock";
+import {
+  analyzeTopicsWithDelay,
+  scrapeAdobeStock,
+  processTopicsWithDelay,
+  checkSanity,
+} from "@shared/api/adobe-stock";
+import { getSavedTopics } from "@shared/api/saved-items";
+import { saveScanHistory } from "@shared/api/history";
+import { enrichMarketActivities } from "@shared/api/market-activity";
+import {
+  claimNextMainTopic,
+  failMainTopicQueueItem,
+  finishMainTopicQueueItem,
+  renewMainTopicLease,
+} from "@shared/api/scan-queue";
 
 const DEFAULT_PROMPT = `Разбей тему '' на 10 конкретных, коммерческих подтем (visual concepts), которые покупатели ищут на стоках. Темы должны быть описательными и состоять из 1-3 слов. Верни ТОЛЬКО валидный JSON массив строк на английском языке (["topic1", "topic2"]).`;
 
 const STORAGE_KEY = "latest_scan_results";
+
+interface ScanSettings {
+  apiKey: string;
+  model: string;
+  filters: ContentFilter[];
+  prompt: string;
+  minResults: number;
+  maxResults: number;
+}
+
+interface ScanExecutionResult {
+  historySessionId: string;
+  blockedReason?: string;
+}
 
 export default function ContentApp() {
   const [isOpen, setIsOpen] = useState(false);
@@ -15,11 +48,16 @@ export default function ContentApp() {
   const [filters, setFilters] = useState<ContentFilter[]>(["photo"]);
   const [topic, setTopic] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
-  const [phase, setPhase] = useState<"idle" | "generating" | "scraping" | "done" | "error">("idle");
+  const [phase, setPhase] = useState<"idle" | "generating" | "scraping" | "analyzing" | "done" | "error">("idle");
   const [progress, setProgress] = useState({ cur: 0, total: 0 });
   const [error, setError] = useState("");
   const [minResults, setMinResults] = useState(20000);
   const [maxResults, setMaxResults] = useState(1000000);
+  const [queueTopic, setQueueTopic] = useState<string | null>(null);
+  const [queueWaitingUntil, setQueueWaitingUntil] = useState<string | null>(null);
+  const queueRunnerActiveRef = useRef(false);
+  const queueRunnerIdRef = useRef(crypto.randomUUID());
+  const scanActiveRef = useRef(false);
 
   // Load settings
   useEffect(() => {
@@ -54,40 +92,225 @@ export default function ContentApp() {
     }
   };
 
-  const handleSearch = useCallback(async () => {
-    const t = topic.trim();
-    if (!t || !apiKey.trim()) return;
+  const executeScan = useCallback(async (
+    scanTopic: string,
+    settings: ScanSettings,
+  ): Promise<ScanExecutionResult> => {
+    if (scanActiveRef.current) throw new Error("Другой скан уже выполняется");
+    const t = scanTopic.trim();
+    if (!t || !settings.apiKey.trim()) throw new Error("Не задана тема или OpenAI API ключ");
+    scanActiveRef.current = true;
+    setTopic(t);
+    const scanTimestamp = Date.now();
     setPhase("generating");
     setError("");
     setProgress({ cur: 0, total: 0 });
 
     try {
-      const ai = await generateTopics(apiKey, model, t, prompt);
+      const ai = await generateTopics(settings.apiKey, settings.model, t, settings.prompt);
       setPhase("scraping");
       setProgress({ cur: 0, total: ai.topics.length + 1 });
 
-      const userResult = await scrapeAdobeStock(t, filters);
+      const userResult = await scrapeAdobeStock(t, settings.filters);
       setProgress((p) => ({ ...p, cur: 1 }));
 
-      const results = await processTopicsWithDelay(ai.topics, filters, (idx) => {
-        setProgress((p) => ({ ...p, cur: idx + 2 }));
-      });
+      const marketCounterBlocked = (
+        userResult.marketSalesStatus === "waf_blocked"
+        || userResult.marketAiStatus === "waf_blocked"
+      );
+      const rawResults = marketCounterBlocked
+        ? ai.topics.map((generatedTopic) => ({
+          topic: generatedTopic,
+          demand: null,
+          status: "waf_blocked" as const,
+          undiscoveredCount: null,
+          marketSalesStatus: "waf_blocked" as const,
+        }))
+        : await processTopicsWithDelay(ai.topics, settings.filters, (idx) => {
+          setProgress((p) => ({ ...p, cur: idx + 2 }));
+        });
 
-      const warning = checkSanity(results);
+      const activityResults = await enrichMarketActivities(
+        [userResult, ...rawResults],
+        new Date(scanTimestamp).toISOString(),
+      );
+      const userResultWithActivity = activityResults[0];
+      const results = activityResults.slice(1);
+
+      const warning = marketCounterBlocked
+        ? "Adobe остановил один из рыночных счётчиков. Очередь подтем остановлена до следующего запуска."
+        : checkSanity(results);
+      const passingTopics = results
+        .filter((result) => (
+          result.status === "ok" &&
+          result.demand !== null &&
+          result.demand >= settings.minResults &&
+          result.demand <= settings.maxResults
+        ))
+        .map((result) => result.topic);
+      const topicsForAnalytics = [t, ...passingTopics];
+      const savedItems = await getSavedTopics().catch(() => []);
+      const favoriteTopics = new Set(
+        savedItems.map((item) => item.subtopic.trim().toLocaleLowerCase()),
+      );
+
+      setPhase("analyzing");
+      setProgress({ cur: 0, total: topicsForAnalytics.length });
+      const analyticsByTopic = await analyzeTopicsWithDelay(
+        topicsForAnalytics,
+        favoriteTopics,
+        ({ completed, total }) => setProgress({ cur: completed, total }),
+        true,
+      );
+      const userTopicResult = {
+        ...userResultWithActivity,
+        analytics: analyticsByTopic.get(t.toLocaleLowerCase()),
+      };
+      const enrichedResults = results.map((result) => ({
+        ...result,
+        analytics: analyticsByTopic.get(result.topic.trim().toLocaleLowerCase()),
+      }));
+
+      const scanPayload: ScanPayload = {
+        userTopicResult,
+        results: enrichedResults,
+        warning,
+        topic: t,
+        timestamp: scanTimestamp,
+        model: settings.model,
+        filters: settings.filters,
+        minResults: settings.minResults,
+        maxResults: settings.maxResults,
+      };
+      const historySessionId = await saveScanHistory(scanPayload);
       await chrome.storage.local.set({
-        [STORAGE_KEY]: { userTopicResult: userResult, results, warning, topic: t, timestamp: Date.now(), model, filters, minResults, maxResults },
+        [STORAGE_KEY]: { ...scanPayload, historySessionId },
       });
 
       setPhase("done");
-      chrome.runtime.sendMessage({ type: "OPEN_DASHBOARD" });
+      await chrome.runtime.sendMessage({ type: "OPEN_DASHBOARD" });
+      const blockingAnalytics = [
+        userTopicResult.analytics,
+        ...enrichedResults.map((result) => result.analytics),
+      ].find((analytics) => (
+        analytics
+        && ["waf_blocked", "parser_degraded", "scan_blocked"].includes(analytics.status)
+      ));
+      return {
+        historySessionId,
+        blockedReason: marketCounterBlocked
+          ? warning ?? "Adobe остановил рыночный счётчик"
+          : blockingAnalytics?.error,
+      };
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setPhase("error");
+      throw err;
+    } finally {
+      scanActiveRef.current = false;
     }
-  }, [topic, apiKey, model, filters, prompt]);
+  }, []);
 
-  const working = phase === "generating" || phase === "scraping";
-  const canSearch = topic.trim().length > 0 && apiKey.trim().length > 0 && !working;
+  const handleSearch = useCallback(async () => {
+    const t = topic.trim();
+    if (!t || !apiKey.trim()) return;
+    try {
+      await executeScan(t, { apiKey, model, filters, prompt, minResults, maxResults });
+      window.dispatchEvent(new CustomEvent("topichunter-run-queue"));
+    } catch {
+      // executeScan already exposes the error in the panel.
+    }
+  }, [topic, apiKey, model, filters, prompt, minResults, maxResults, executeScan]);
+
+  const runMainTopicQueue = useCallback(async () => {
+    if (queueRunnerActiveRef.current || scanActiveRef.current) return;
+    queueRunnerActiveRef.current = true;
+    setQueueWaitingUntil(null);
+
+    try {
+      const claim = await claimNextMainTopic(queueRunnerIdRef.current);
+      if (!claim.item) {
+        setQueueWaitingUntil(claim.waitUntil);
+        return;
+      }
+
+      const item = claim.item;
+      setQueueTopic(item.topic);
+      setIsOpen(true);
+      const stored = await chrome.storage.local.get([
+        "openai_api_key",
+        "th_model",
+        "th_filters",
+        "th_min",
+        "th_max",
+        "th_prompt",
+      ]);
+      const queueApiKey = typeof stored.openai_api_key === "string" ? stored.openai_api_key : "";
+      if (!queueApiKey.trim()) {
+        const message = "Очередь остановлена: не сохранён OpenAI API ключ";
+        await failMainTopicQueueItem(item.id, queueRunnerIdRef.current, message);
+        throw new Error(message);
+      }
+      const queueFilters = Array.isArray(stored.th_filters)
+        ? stored.th_filters.filter((filter): filter is ContentFilter => (
+            filter === "photo" || filter === "vector" || filter === "illustration" || filter === "video"
+          ))
+        : ["photo" as const];
+      const settings: ScanSettings = {
+        apiKey: queueApiKey,
+        model: typeof stored.th_model === "string" ? stored.th_model : AVAILABLE_MODELS[0].id,
+        filters: queueFilters.length > 0 ? queueFilters : ["photo"],
+        prompt: typeof stored.th_prompt === "string" ? stored.th_prompt : DEFAULT_PROMPT,
+        minResults: Number.isFinite(Number(stored.th_min)) ? Number(stored.th_min) : 20000,
+        maxResults: Number.isFinite(Number(stored.th_max)) ? Number(stored.th_max) : 1000000,
+      };
+      const leaseTimer = window.setInterval(() => {
+        void renewMainTopicLease(item.id, queueRunnerIdRef.current).catch(() => undefined);
+      }, 45_000);
+
+      try {
+        const result = await executeScan(item.topic, settings);
+        const nextState = await finishMainTopicQueueItem(
+          item.id,
+          queueRunnerIdRef.current,
+          result.historySessionId,
+          result.blockedReason,
+        );
+        if (result.blockedReason) {
+          setError(`Очередь остановлена: ${result.blockedReason}`);
+          setPhase("error");
+        } else {
+          setQueueWaitingUntil(nextState.nextRunAt);
+        }
+      } catch (queueError) {
+        const message = queueError instanceof Error ? queueError.message : String(queueError);
+        await failMainTopicQueueItem(item.id, queueRunnerIdRef.current, message).catch(() => undefined);
+        setError(message);
+        setPhase("error");
+      } finally {
+        window.clearInterval(leaseTimer);
+        setQueueTopic(null);
+      }
+    } catch (queueError) {
+      setError(queueError instanceof Error ? queueError.message : String(queueError));
+      setPhase("error");
+    } finally {
+      queueRunnerActiveRef.current = false;
+    }
+  }, [executeScan]);
+
+  useEffect(() => {
+    const handler = () => void runMainTopicQueue();
+    window.addEventListener("topichunter-run-queue", handler);
+    const initialCheck = window.setTimeout(handler, 1_000);
+    return () => {
+      window.clearTimeout(initialCheck);
+      window.removeEventListener("topichunter-run-queue", handler);
+    };
+  }, [runMainTopicQueue]);
+
+  const working = phase === "generating" || phase === "scraping" || phase === "analyzing";
+  const canSearch = topic.trim().length > 0 && apiKey.trim().length > 0 && !working && queueTopic === null;
   const pct = progress.total > 0 ? Math.round((progress.cur / progress.total) * 100) : 0;
 
   // ── FAB (minimized) ────────────────────────
@@ -127,6 +350,10 @@ export default function ContentApp() {
 
       {/* Body */}
       <div className="p-4 overflow-y-auto max-h-[520px] flex flex-col gap-3">
+        <div className="px-3 py-2.5 rounded-xl bg-th-warning/8 border border-th-warning/20 text-[11px] leading-relaxed text-th-warning">
+          Сканируйте только в отдельном профиле Chrome без входа в Adobe Stock. При признаках активной сессии очередь остановится.
+        </div>
+
         {/* API Key */}
         <div className="flex flex-col gap-1.5">
           <label className="text-xs font-medium text-th-text-sec">🔑 OpenAI API ключ</label>
@@ -195,9 +422,13 @@ export default function ContentApp() {
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-1.5 text-xs text-th-text-muted">
               <div className="w-1.5 h-1.5 rounded-full bg-th-accent animate-pulse" />
-              {phase === "generating" ? "Генерация подтем…" : `Скрапинг ${progress.cur}/${progress.total}…`}
+              {phase === "generating"
+                ? "Генерация подтем…"
+                : phase === "analyzing"
+                  ? `Анализ top-100 ${progress.cur}/${progress.total}…`
+                  : `Проверка спроса ${progress.cur}/${progress.total}…`}
             </div>
-            {phase === "scraping" && (
+            {(phase === "scraping" || phase === "analyzing") && (
               <div className="w-full h-1 rounded bg-th-input overflow-hidden">
                 <div className="h-full bg-th-accent rounded transition-[width] duration-300" style={{ width: `${pct}%` }} />
               </div>
@@ -213,6 +444,14 @@ export default function ContentApp() {
           <div className="text-xs text-th-success">✅ Готово! Результаты открыты в дашборде.</div>
         )}
 
+        {(queueTopic || queueWaitingUntil) && (
+          <div className="px-3 py-2.5 rounded-xl bg-th-accent/8 border border-th-accent/20 text-xs text-th-text-sec leading-relaxed">
+            {queueTopic
+              ? <>Очередь главных тем: сейчас <span className="font-semibold text-th-text">{queueTopic}</span></>
+              : <>Следующая тема после паузы: <span className="font-semibold text-th-text">{new Date(queueWaitingUntil!).toLocaleString("ru-RU")}</span></>}
+          </div>
+        )}
+
         {/* Search button */}
         <button onClick={handleSearch} disabled={!canSearch}
           className={`w-full py-2.5 rounded-xl text-[13px] font-semibold border-none cursor-pointer flex items-center justify-center gap-2 transition-all ${
@@ -224,7 +463,11 @@ export default function ContentApp() {
                 <circle style={{ opacity: 0.25 }} cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path style={{ opacity: 0.75 }} fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
-              {phase === "generating" ? "Генерация…" : `Скрапинг ${pct}%`}
+              {phase === "generating"
+                ? "Генерация…"
+                : phase === "analyzing"
+                  ? `Top-100 ${pct}%`
+                  : `Спрос ${pct}%`}
             </>
           ) : (
             <>

@@ -1,231 +1,371 @@
-import { useState } from "react";
-import type { TopicResult } from "@shared/types";
+import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { getSavedTopics, saveTopic } from "@shared/api/saved-items";
+import OpportunityDot from "./OpportunityDot";
+import ActivityCell from "./ActivityCell";
+import type {
+  AgeWindowMetric,
+  AnalyticsStatus,
+  SavedItem,
+  TopicAnalytics,
+  TopicResult,
+} from "@shared/types";
 
 interface ResultsTableProps {
-  /** The user's original topic — displayed as the first row with accent styling */
+  mainTopic: string;
   userTopicResult: TopicResult | null;
-  /** AI-generated subtopics with their scraping results */
   results: TopicResult[];
-  /** Warning message from sanity check (if any) */
   warning: string | null;
-  /** Total number of expected AI results (for skeleton count) */
   expectedCount: number;
-  /** Whether the AI generation phase is still running */
   isGenerating: boolean;
+  savedItems?: SavedItem[];
+  onRemoveSaved?: (id: string) => Promise<void>;
+  scanSessionId?: string;
+  scanTimestamp?: number;
+  onOpenSavedScan?: (item: SavedItem) => void;
 }
 
-/**
- * ResultsTable — displays user topic + AI-generated subtopics with demand data
- *
- * Features:
- * - User's topic as the first highlighted row (violet accent)
- * - Skeleton loading rows for topics being scraped
- * - Copy & Favorite action buttons per row
- * - Sanity check warning banner
- * - Stats bar (total, in-range, errors)
- */
+interface DisplayRow {
+  result: TopicResult;
+  key: string;
+  source: boolean;
+  number: number | null;
+  savedId?: string;
+  mainTopicLabel?: string;
+  savedItem?: SavedItem;
+}
+
+const SAVED_STORAGE_KEY = "topicHunter_savedTopics";
+
+function savedTopicKey(mainTopic: string, subtopic: string): string {
+  return `${mainTopic.trim().toLocaleLowerCase()}\u0000${subtopic.trim().toLocaleLowerCase()}`;
+}
+
 export default function ResultsTable({
+  mainTopic,
   userTopicResult,
   results,
   warning,
   expectedCount,
   isGenerating,
+  savedItems,
+  onRemoveSaved,
+  scanSessionId,
+  scanTimestamp,
+  onOpenSavedScan,
 }: ResultsTableProps) {
-  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [savingKeys, setSavingKeys] = useState<Set<string>>(() => new Set());
+  const [savedTopicKeys, setSavedTopicKeys] = useState<Set<string>>(() => new Set());
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
 
-  const handleCopy = async (text: string, index: number) => {
+  const savedMode = savedItems !== undefined;
+  const rows: DisplayRow[] = savedMode
+    ? savedItems.map((item, index) => ({
+      result: {
+        topic: item.subtopic,
+        demand: item.demand,
+        status: "ok" as const,
+        undiscoveredCount: item.undiscoveredCount,
+        totalAiCount: item.totalAiCount,
+        undiscoveredAiCount: item.undiscoveredAiCount,
+        activity: item.activity,
+        analytics: item.analytics,
+      },
+      key: `saved-${item.id}`,
+      source: false,
+      number: index + 1,
+      savedId: item.id,
+      mainTopicLabel: item.mainTopic,
+      savedItem: item,
+    }))
+    : [
+      ...(userTopicResult
+        ? [{ result: userTopicResult, key: "source-topic", source: true, number: null }]
+        : []),
+      ...results.map((result, index) => ({
+        result,
+        key: `result-${index}-${result.topic}`,
+        source: false,
+        number: index + 1,
+      })),
+    ];
+
+  useEffect(() => {
+    let active = true;
+
+    const applyItems = (items: SavedItem[]) => {
+      if (!active) return;
+      setSavedTopicKeys(new Set(items.map((item) => savedTopicKey(item.mainTopic, item.subtopic))));
+    };
+    const loadItems = async () => {
+      if (savedItems) {
+        applyItems(savedItems);
+        return;
+      }
+      applyItems(await getSavedTopics());
+    };
+    void loadItems().catch(() => {
+      if (active) setSavedTopicKeys(new Set());
+    });
+
+    const handleStorageChange = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string,
+    ) => {
+      if (areaName !== "local" || !changes[SAVED_STORAGE_KEY]) return;
+      const nextItems = changes[SAVED_STORAGE_KEY].newValue;
+      applyItems(Array.isArray(nextItems) ? nextItems as SavedItem[] : []);
+    };
+    chrome.storage?.onChanged?.addListener(handleStorageChange);
+    return () => {
+      active = false;
+      chrome.storage?.onChanged?.removeListener(handleStorageChange);
+    };
+  }, [savedItems]);
+
+  const isRowSaved = (row: DisplayRow): boolean => {
+    if (savedMode) return true;
+    const rowMainTopic = row.mainTopicLabel || mainTopic || row.result.topic;
+    return savedTopicKeys.has(savedTopicKey(rowMainTopic, row.result.topic));
+  };
+
+  const handleCopy = async (text: string, key: string) => {
     try {
       await navigator.clipboard.writeText(text);
-      setCopiedIndex(index);
-      setTimeout(() => setCopiedIndex(null), 1500);
     } catch {
-      // Fallback
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      document.body.appendChild(textarea);
+      textarea.select();
       document.execCommand("copy");
-      document.body.removeChild(ta);
-      setCopiedIndex(index);
-      setTimeout(() => setCopiedIndex(null), 1500);
+      document.body.removeChild(textarea);
+    }
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 1500);
+  };
+
+  const handleSave = async (row: DisplayRow) => {
+    if (savingKeys.has(row.key) || (!savedMode && isRowSaved(row))) return;
+
+    setSaveError(null);
+    setSavingKeys((current) => new Set(current).add(row.key));
+    try {
+      if (savedMode) {
+        if (!row.savedId || !onRemoveSaved) throw new Error("Не удалось определить сохранённую тему");
+        await onRemoveSaved(row.savedId);
+        return;
+      }
+      await saveTopic(
+        mainTopic || row.mainTopicLabel || row.result.topic,
+        row.result.topic,
+        row.result.demand,
+        row.result.undiscoveredCount,
+        row.result.analytics,
+        row.result.totalAiCount,
+        row.result.undiscoveredAiCount,
+        row.result.activity,
+        scanSessionId,
+        scanTimestamp,
+      );
+      const rowMainTopic = mainTopic || row.mainTopicLabel || row.result.topic;
+      setSavedTopicKeys((current) => new Set(current).add(savedTopicKey(rowMainTopic, row.result.topic)));
+    } catch (error: unknown) {
+      setSaveError(error instanceof Error
+        ? error.message
+        : savedMode
+          ? "Не удалось удалить тему из избранного"
+          : "Не удалось добавить тему в избранное");
+    } finally {
+      setSavingKeys((current) => {
+        const next = new Set(current);
+        next.delete(row.key);
+        return next;
+      });
     }
   };
 
-  // Stats
-  const completedResults = results.filter((r) => r.status !== "pending");
-  const successResults = completedResults.filter((r) => r.status === "ok");
-  const errorResults = completedResults.filter((r) => r.status === "error" || r.status === "waf_blocked");
+  const successful = rows.filter((row) => row.result.status === "ok").length;
+  const errors = rows.filter(
+    (row) => row.result.status === "error" || row.result.status === "waf_blocked",
+  ).length;
 
   return (
     <div className="space-y-3 animate-fade-in">
-      {/* ── Warning Banner ────────────────────────────── */}
-      {warning && (
-        <div className="flex items-start gap-3 px-5 py-3.5 rounded-xl bg-warning/8 border border-warning/20">
-          <svg className="w-5 h-5 text-warning flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
-          </svg>
-          <div>
-            <p className="text-sm font-medium text-warning">Предупреждение</p>
-            <p className="text-xs text-warning/80 mt-0.5">{warning}</p>
-          </div>
+      {warning && <WarningBanner text={warning} />}
+      {saveError && (
+        <div className="flex items-center justify-between gap-3 px-5 py-3 rounded-xl bg-error/8 border border-error/20">
+          <p className="text-sm text-error">{saveError}</p>
+          <button type="button" onClick={() => setSaveError(null)} className="text-error cursor-pointer">×</button>
         </div>
       )}
 
-      {/* ── User Topic Card (above table) ─────────────── */}
-      {userTopicResult && (
-        <div className="bg-gradient-to-r from-accent/10 via-accent/5 to-transparent border border-accent/20 rounded-2xl p-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-accent/15 border border-accent/25">
-              <svg className="w-4.5 h-4.5 text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
-              </svg>
-            </div>
-            <div>
-              <p className="text-xs text-accent font-medium uppercase tracking-wider">Ваша тема</p>
-              <p className="text-base font-semibold text-text-primary">{userTopicResult.topic}</p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-4">
-            {/* Demand */}
-            <div className="text-right">
-              <p className="text-xs text-text-muted">Спрос</p>
-              {userTopicResult.status === "pending" ? (
-                <div className="w-16 h-5 rounded bg-accent/10 animate-pulse mt-0.5" />
-              ) : userTopicResult.status === "ok" ? (
-                <p className="text-lg font-bold text-accent tabular-nums">
-                  {formatDemand(userTopicResult.demand)}
-                </p>
-              ) : (
-                <StatusBadge status={userTopicResult.status} />
-              )}
-            </div>
-
-            {/* Actions */}
-            <div className="flex items-center gap-1.5">
-              <ActionButton
-                icon="copy"
-                title="Копировать"
-                isCopied={copiedIndex === -1}
-                onClick={() => handleCopy(userTopicResult.topic, -1)}
-              />
-              <ActionButton icon="heart" title="В избранное" onClick={() => {}} />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── Stats Bar ─────────────────────────────────── */}
-      <div className="flex items-center gap-4 px-1">
-        <h3 className="text-base font-semibold text-text-primary">AI Результаты</h3>
-        <div className="flex items-center gap-3 text-xs">
-          <span className="text-text-muted">
-            Всего: <span className="text-text-secondary font-medium">{expectedCount}</span>
-          </span>
-          {successResults.length > 0 && (
-            <span className="text-success">
-              Успешно: <span className="font-medium">{successResults.length}</span>
-            </span>
-          )}
-          {errorResults.length > 0 && (
-            <span className="text-error">
-              Ошибок: <span className="font-medium">{errorResults.length}</span>
-            </span>
-          )}
-        </div>
-
-        {/* Generating indicator */}
-        {isGenerating && (
-          <div className="ml-auto flex items-center gap-2 text-xs text-accent">
-            <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-            </svg>
-            Генерация подтем…
-          </div>
-        )}
+      <div className="flex flex-wrap items-center gap-4 px-1">
+        <h3 className="text-base font-semibold text-text-primary">{savedMode ? "Избранное и top-100" : "Результаты и top-100"}</h3>
+        <span className="text-xs text-text-muted">{savedMode ? "Тем" : "Подтем"}: {expectedCount}</span>
+        {!savedMode && <span className="text-xs text-success">Счётчик получен: {successful}</span>}
+        {errors > 0 && <span className="text-xs text-error">Ошибок: {errors}</span>}
+        {isGenerating && <span className="text-xs text-accent animate-pulse">Обновление…</span>}
       </div>
 
-      {/* ── Table ──────────────────────────────────────── */}
-      <div className="bg-bg-card border border-border rounded-2xl overflow-hidden">
-        <table className="w-full">
+      <div className="bg-bg-card border border-border rounded-2xl overflow-x-auto">
+        <table className="w-[2496px] min-w-full table-fixed border-separate border-spacing-0">
+          <colgroup>
+            <col className="w-12" />
+            <col className="w-60" />
+            <col className="w-52" />
+            <col className="w-24" />
+            <col className="w-44" />
+            <col className="w-44" />
+            <col className="w-44" />
+            <col className="w-44" />
+            <col className="w-44" />
+            <col className="w-52" />
+            <col className="w-56" />
+            <col className="w-56" />
+            <col className="w-40" />
+            <col className="w-52" />
+          </colgroup>
           <thead>
-            <tr className="border-b border-border">
-              <th className="w-12 px-4 py-3 text-left text-xs font-medium text-text-muted uppercase tracking-wider">#</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-text-muted uppercase tracking-wider">Тема</th>
-              <th className="w-32 px-4 py-3 text-right text-xs font-medium text-text-muted uppercase tracking-wider">Спрос</th>
-              <th className="w-24 px-4 py-3 text-center text-xs font-medium text-text-muted uppercase tracking-wider">Действие</th>
+            <tr>
+              <StickyHeader className="left-0 w-12">#</StickyHeader>
+              <StickyHeader className="left-12 w-60 text-left">Тема</StickyHeader>
+              <StickyHeader className="left-72 w-52 text-right">Кол-во работ</StickyHeader>
+              <StickyHeader className="left-[496px] w-24">Действия</StickyHeader>
+              <HeaderCell>AI в top-100</HeaderCell>
+              <HeaderCell>≤ 1 мес.</HeaderCell>
+              <HeaderCell>≤ 2 мес.</HeaderCell>
+              <HeaderCell>≤ 3 мес.</HeaderCell>
+              <HeaderCell>≤ 6 мес.</HeaderCell>
+              <HeaderCell>Динамика</HeaderCell>
+              <HeaderCell>Активность 30д</HeaderCell>
+              <HeaderCell>Проходимость</HeaderCell>
+              <HeaderCell>Данные</HeaderCell>
+              <HeaderCell>Фраза в заголовке top-10</HeaderCell>
             </tr>
           </thead>
           <tbody>
-            {/* AI Results rows */}
-            {results.map((result, idx) => (
-              <tr
-                key={idx}
-                className="border-b border-border/50 hover:bg-bg-card-hover transition-colors duration-150 group"
-              >
-                {/* # */}
-                <td className="px-4 py-3 text-sm text-text-muted tabular-nums">{idx + 1}</td>
-
-                {/* Topic name */}
-                <td className="px-4 py-3">
-                  {result.status === "pending" && !result.topic ? (
-                    <div className="w-48 h-4 rounded bg-border/40 animate-pulse" />
-                  ) : (
-                    <span className="text-sm font-medium text-text-primary">{result.topic}</span>
-                  )}
-                </td>
-
-                {/* Demand */}
-                <td className="px-4 py-3 text-right">
-                  {result.status === "pending" ? (
-                    <div className="w-16 h-4 rounded bg-border/40 animate-pulse ml-auto" />
-                  ) : result.status === "ok" ? (
-                    <span className={`text-sm font-semibold tabular-nums ${getDemandColor(result.demand)}`}>
-                      {formatDemand(result.demand)}
+            {rows.map((row) => (
+              <Fragment key={row.key}>
+                <tr className={`group ${row.source ? "bg-accent/5" : "hover:bg-bg-card-hover"}`}>
+                <StickyCell className="left-0 w-12 text-center text-text-muted">
+                  {row.source ? "★" : row.number}
+                </StickyCell>
+                <StickyCell className="left-12 w-60">
+                  {row.source && (
+                    <span className="block max-w-52 truncate text-[10px] uppercase tracking-wider text-accent">
+                      Ваша тема
                     </span>
-                  ) : (
-                    <StatusBadge status={result.status} />
                   )}
-                </td>
-
-                {/* Actions */}
-                <td className="px-4 py-3">
-                  <div className="flex items-center justify-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
-                    <ActionButton
-                      icon="copy"
-                      title="Копировать"
-                      isCopied={copiedIndex === idx}
-                      onClick={() => handleCopy(result.topic, idx)}
-                    />
-                    <ActionButton icon="heart" title="В избранное" onClick={() => {}} />
+                  {!row.source && row.mainTopicLabel && (
+                    <button
+                      type="button"
+                      onClick={() => row.savedItem && onOpenSavedScan?.(row.savedItem)}
+                      disabled={!row.savedItem || !onOpenSavedScan}
+                      className="block max-w-52 truncate bg-transparent p-0 text-left text-[10px] uppercase tracking-wider text-accent cursor-pointer hover:underline disabled:cursor-default disabled:no-underline"
+                      title="Открыть весь сохранённый скан основной темы"
+                    >
+                      {row.mainTopicLabel}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={!row.result.analytics?.snapshot}
+                    onClick={() => setExpandedKey((current) => current === row.key ? null : row.key)}
+                    className="flex w-full items-center gap-2 text-left disabled:cursor-default cursor-pointer"
+                    title={row.result.analytics?.snapshot ? "Показать 100 работ" : row.result.topic}
+                  >
+                    <span className="text-text-muted">{row.result.analytics?.snapshot ? (expandedKey === row.key ? "▾" : "▸") : ""}</span>
+                    <span className="block max-w-52 truncate text-sm font-medium text-text-primary">
+                      {row.result.topic}
+                    </span>
+                  </button>
+                </StickyCell>
+                <StickyCell className="left-72 w-52 text-right">
+                  <DemandSummary result={row.result} />
+                </StickyCell>
+                <StickyCell className="left-[496px] w-24 text-center">
+                  <div className="flex flex-col items-center gap-1.5">
+                    <div className="flex items-center justify-center gap-1">
+                      <ActionButton
+                        kind="copy"
+                        active={copiedKey === row.key}
+                        title="Копировать"
+                        onClick={() => void handleCopy(row.result.topic, row.key)}
+                      />
+                      <ActionButton
+                        kind="heart"
+                        active={isRowSaved(row)}
+                        loading={savingKeys.has(row.key)}
+                        allowActiveClick={savedMode}
+                        title={savedMode ? "Удалить из избранного" : isRowSaved(row) ? "Уже в избранном" : "В избранное"}
+                        onClick={() => void handleSave(row)}
+                      />
+                    </div>
+                    <OpportunityDot analytics={row.result.analytics} />
                   </div>
-                </td>
-              </tr>
+                </StickyCell>
+                  <AnalyticsCells result={row.result} />
+                </tr>
+                {expandedKey === row.key && row.result.analytics?.snapshot && (
+                  <tr>
+                    <td colSpan={14} className="border-b border-border bg-bg-primary/60 px-5 py-4">
+                      <AssetDetails analytics={row.result.analytics} />
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
             ))}
 
-            {/* Skeleton rows while AI is generating */}
-            {isGenerating && results.length < expectedCount &&
-              Array.from({ length: expectedCount - results.length }).map((_, idx) => (
-                <tr key={`skeleton-${idx}`} className="border-b border-border/50">
-                  <td className="px-4 py-3">
-                    <div className="w-5 h-4 rounded bg-border/30 animate-pulse" />
-                  </td>
-                  <td className="px-4 py-3">
-                    <div
-                      className="h-4 rounded bg-border/30 animate-pulse"
-                      style={{ width: `${120 + Math.random() * 140}px` }}
-                    />
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="w-14 h-4 rounded bg-border/30 animate-pulse ml-auto" />
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="w-12 h-4 rounded bg-border/30 animate-pulse mx-auto" />
-                  </td>
-                </tr>
-              ))
-            }
+            {!savedMode && isGenerating && rows.length < expectedCount && (
+              <tr><td colSpan={14} className="px-4 py-4 text-sm text-text-muted animate-pulse">Анализ продолжается…</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="px-1 text-[11px] text-text-muted">
+        «С продажами» = общее число работ минус Undiscovered. Доля AI = AI-работы среди всех; продажи = доля работ с продажами среди всех; продажи AI = доля работ с продажами среди AI. «В top-10» показывает, сколько работ из указанного возрастного диапазона находится на первых десяти позициях. Активность 30д — proxy прироста работ с первой продажей; главное значение является нижней 95% границей Уилсона.
+      </p>
+    </div>
+  );
+}
+
+function AssetDetails({ analytics }: { analytics: TopicAnalytics }) {
+  const snapshot = analytics.snapshot;
+  if (!snapshot) return null;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-4 text-xs text-text-muted">
+        <span>batch: <span className="text-text-secondary">{snapshot.batchId.slice(0, 8)}</span></span>
+        <span>{new Date(snapshot.checkedAt).toLocaleString("ru-RU")}</span>
+        <span>parser: {snapshot.parserVersion}</span>
+        <span>date model: {snapshot.dateModelVersion}</span>
+      </div>
+      <div className="max-h-80 overflow-auto rounded-xl border border-border">
+        <table className="w-full min-w-[1100px] text-xs">
+          <thead className="sticky top-0 bg-bg-card">
+            <tr>
+              {['Ранг', 'Asset ID', 'Заголовок', 'Дата по ID', 'Погрешность', 'AI', 'Продажи'].map((label) => (
+                <th key={label} className="border-b border-border px-3 py-2 text-left font-medium text-text-muted">{label}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {snapshot.assets.map((asset) => (
+              <tr key={asset.assetId} className="odd:bg-bg-input/30">
+                <td className="px-3 py-2 tabular-nums text-text-muted">{asset.rank}</td>
+                <td className="px-3 py-2 font-medium tabular-nums text-text-primary">{asset.assetId}</td>
+                <td className="max-w-96 truncate px-3 py-2 text-text-secondary" title={asset.title ?? undefined}>
+                  {asset.title ?? "unknown"}
+                </td>
+                <td className="px-3 py-2 tabular-nums text-text-secondary">{asset.estimatedUploadDate ?? "unknown"}</td>
+                <td className="px-3 py-2 text-text-muted">{asset.dateErrorDays === null ? "—" : `±${asset.dateErrorDays} дн.`}</td>
+                <td className="px-3 py-2">{asset.isAi === null ? "unknown" : asset.isAi ? "AI" : "не AI"}</td>
+                <td className="px-3 py-2">{salesStatusLabel(asset.salesStatus)}</td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
@@ -233,87 +373,303 @@ export default function ResultsTable({
   );
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Sub-components & Helpers
-// ────────────────────────────────────────────────────────────────────
-
-/** Format demand number with commas: 524789 → "524,789" */
-function formatDemand(demand: number | null): string {
-  if (demand === null) return "—";
-  return demand.toLocaleString("en-US");
+function salesStatusLabel(status: "sold" | "undiscovered" | "unknown"): string {
+  if (status === "sold") return "есть ≥1";
+  if (status === "undiscovered") return "нет";
+  return "unknown";
 }
 
-/** Color-code demand: green if high, orange if medium, red-ish if low */
-function getDemandColor(demand: number | null): string {
-  if (demand === null) return "text-text-muted";
-  if (demand >= 100000) return "text-success";
-  if (demand >= 20000) return "text-accent";
-  if (demand >= 5000) return "text-warning";
-  return "text-error";
-}
+function AnalyticsCells({ result }: { result: TopicResult }) {
+  const analytics = result.analytics;
+  if (!analytics) {
+    const reason = result.status === "ok"
+      ? "Top-100 не сканировался: спрос вне заданного диапазона"
+      : "Top-100 не сканировался: спрос не получен";
+    return <EmptyAnalyticsCells text={reason} activity={result.activity} />;
+  }
+  if (!analytics.metrics) {
+    return <EmptyAnalyticsCells text={analytics.error ?? analyticsStatusLabel(analytics.status)} status={analytics.status} activity={result.activity} />;
+  }
 
-/** Status badge for error / WAF blocked states */
-function StatusBadge({ status }: { status: string }) {
-  const isWaf = status === "waf_blocked";
+  const { metrics } = analytics;
   return (
-    <span
-      className={`
-        inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium
-        ${isWaf ? "bg-warning/10 text-warning" : "bg-error/10 text-error"}
-      `}
-    >
-      <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
-        <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clipRule="evenodd" />
-      </svg>
-      {isWaf ? "WAF" : "Ошибка"}
-    </span>
+    <>
+      <MetricCell
+        primary={`${metrics.aiCount}/${metrics.topCount}`}
+        secondary={`В top-10 = ${metrics.aiTop10Count}`}
+      />
+      {([1, 2, 3, 6] as const).map((months) => {
+        const metric = metrics.ageWindows.find((window) => window.months === months);
+        return <AgeCell key={months} metric={metric} />;
+      })}
+      <DynamicsCell analytics={analytics} />
+      <ActivityCell activity={result.activity} />
+      <td className="border-b border-border/50 px-3 py-3 min-w-44">
+        <VerdictBadge verdict={metrics.verdict} />
+        <p className="mt-1 text-[11px] leading-snug text-text-muted">{metrics.verdictReason}</p>
+      </td>
+      <td className="border-b border-border/50 px-3 py-3 min-w-36">
+        <p className="text-xs font-medium text-text-secondary">{analyticsStatusLabel(analytics.status)}</p>
+        <p className="mt-1 text-[11px] text-text-muted">
+          confidence: {analytics.confidence}{analytics.cached ? " · кэш" : ""}
+        </p>
+      </td>
+      <TitleMatchCell analytics={analytics} />
+    </>
   );
 }
 
-/** Small icon button for Copy / Favorite actions */
-function ActionButton({
-  icon,
-  title,
-  isCopied,
-  onClick,
+function AgeCell({ metric }: { metric?: AgeWindowMetric }) {
+  if (!metric) return <MetricCell primary="—" secondary="нет данных" />;
+  return (
+    <MetricCell
+      primary={`${metric.total}/${metric.ai} AI`}
+      secondary={`В top-10 = ${metric.top10Count}`}
+    />
+  );
+}
+
+function MetricCell({ primary, secondary }: { primary: string; secondary: string }) {
+  return (
+    <td className="overflow-hidden border-b border-border/50 px-3 py-3 align-top">
+      <p className="text-sm font-semibold text-text-primary tabular-nums whitespace-nowrap">{primary}</p>
+      <p className="mt-1 text-[11px] leading-snug text-text-muted">{secondary}</p>
+    </td>
+  );
+}
+
+function EmptyAnalyticsCells({
+  text,
+  status,
+  activity,
 }: {
-  icon: "copy" | "heart";
-  title: string;
-  isCopied?: boolean;
-  onClick: () => void;
+  text: string;
+  status?: AnalyticsStatus;
+  activity: TopicResult["activity"];
 }) {
-  if (icon === "copy") {
-    return (
-      <button
-        type="button"
-        onClick={onClick}
-        title={title}
-        className="p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-input transition-all duration-150 cursor-pointer"
-      >
-        {isCopied ? (
-          <svg className="w-4 h-4 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
-          </svg>
-        ) : (
-          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M15.666 3.888A2.25 2.25 0 0 0 13.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v0a.75.75 0 0 1-.75.75H9.334a.75.75 0 0 1-.75-.75v0c0-.212.03-.418.084-.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 0 1-2.25 2.25H6.75A2.25 2.25 0 0 1 4.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 0 1 1.927-.184" />
-          </svg>
-        )}
-      </button>
-    );
+  return (
+    <>
+      <td colSpan={6} className="border-b border-border/50 px-4 py-3 text-sm text-text-muted">
+        <span className={status === "parser_degraded" || status === "waf_blocked" ? "text-error" : ""}>{text}</span>
+      </td>
+      <ActivityCell activity={activity} />
+      <td colSpan={3} className="border-b border-border/50 px-4 py-3 text-sm text-text-muted">—</td>
+    </>
+  );
+}
+
+function DynamicsCell({ analytics }: { analytics: TopicAnalytics }) {
+  const dynamics = analytics.metrics?.dynamics;
+  if (!dynamics) return <MetricCell primary="Первый снимок" secondary="сравнивать пока не с чем" />;
+
+  return (
+    <td
+      className="overflow-hidden border-b border-border/50 px-3 py-3 align-top"
+      title={`Максимальный рост: ${dynamics.biggestRise ?? 0}; максимальное падение: ${dynamics.biggestDrop ?? 0}; средний сдвиг: ${dynamics.averageAbsoluteRankChange ?? 0}`}
+    >
+      <p className="text-sm font-semibold text-text-primary whitespace-nowrap">
+        Ушло {dynamics.exited} · пришло {dynamics.entered}
+      </p>
+      <p className="mt-1 text-[11px] leading-snug text-text-muted">
+        ↑ {dynamics.movedUp ?? 0} · ↓ {dynamics.movedDown ?? 0} · = {dynamics.unchangedRank ?? 0} · ср. сдвиг {dynamics.averageAbsoluteRankChange ?? 0}
+      </p>
+      <p className="mt-1 text-[11px] leading-snug text-text-muted">
+        Новых ID в top-10: {dynamics.enteredTop10 ?? 0}
+      </p>
+      <p className="mt-1 text-[11px] leading-snug text-text-muted">
+        Свежих ≤1м пришло {dynamics.enteredFreshOneMonth ?? 0} · дошли top-10: {dynamics.enteredFreshTop10 ?? 0}
+      </p>
+    </td>
+  );
+}
+
+function TitleMatchCell({ analytics }: { analytics: TopicAnalytics }) {
+  const metrics = analytics.metrics;
+  if (!metrics || metrics.titleMatchesTop10 === null) {
+    const known = metrics ? Math.round(metrics.titleCoverageTop10 * Math.min(10, metrics.topCount)) : 0;
+    return <MetricCell primary="Неизвестно" secondary={`заголовков получено: ${known}`} />;
   }
 
-  // Heart / Favorite
+  const topSize = Math.min(10, metrics.topCount);
+  return (
+    <MetricCell
+      primary={metrics.titleMatchesTop10 === 0 ? "Нет" : `${metrics.titleMatchesTop10} из ${topSize}`}
+      secondary="точная фраза запроса"
+    />
+  );
+}
+
+function StickyHeader({ children, className }: { children: string; className: string }) {
+  return (
+    <th className={`sticky z-20 border-b border-border bg-bg-card px-3 py-3 text-xs font-medium uppercase tracking-wider text-text-muted whitespace-nowrap ${className}`}>
+      {children}
+    </th>
+  );
+}
+
+function HeaderCell({ children }: { children: string }) {
+  return (
+    <th className="border-b border-border bg-bg-card px-3 py-3 text-left text-xs font-medium uppercase tracking-wider text-text-muted whitespace-nowrap">
+      {children}
+    </th>
+  );
+}
+
+function StickyCell({ children, className }: { children: ReactNode; className: string }) {
+  return (
+    <td className={`sticky z-10 overflow-hidden border-b border-border/50 bg-bg-card group-hover:bg-bg-card-hover px-3 py-3 align-top ${className}`}>
+      {children}
+    </td>
+  );
+}
+
+function WarningBanner({ text }: { text: string }) {
+  return (
+    <div className="px-5 py-3.5 rounded-xl bg-warning/8 border border-warning/20 text-sm text-warning">
+      {text}
+    </div>
+  );
+}
+
+function VerdictBadge({ verdict }: { verdict: "open" | "frozen" | "no_fresh_ai" | "insufficient_data" }) {
+  const styles = verdict === "open"
+    ? "bg-success/10 text-success"
+    : verdict === "insufficient_data"
+      ? "bg-text-muted/10 text-text-muted"
+      : "bg-error/10 text-error";
+  const labels = {
+    open: "Есть вход",
+    frozen: "Топ закрыт",
+    no_fresh_ai: "Нет свежего AI",
+    insufficient_data: "Недостаточно данных",
+  };
+  return <span className={`inline-flex px-2 py-0.5 rounded-md text-xs font-semibold ${styles}`}>{labels[verdict]}</span>;
+}
+
+function DemandStatus({ status }: { status: TopicResult["status"] }) {
+  const label = status === "waf_blocked" ? "WAF" : status === "pending" ? "…" : "Ошибка";
+  return <span className="text-xs text-error">{label}</span>;
+}
+
+function DemandSummary({ result }: { result: TopicResult }) {
+  if (result.status !== "ok") return <DemandStatus status={result.status} />;
+
+  const total = result.demand;
+  const rawUndiscovered = result.undiscoveredCount
+    ?? result.analytics?.metrics?.sales.undiscoveredTotal
+    ?? null;
+  const totalsCompatible = (
+    total !== null
+    && rawUndiscovered !== null
+    && rawUndiscovered >= 0
+    && rawUndiscovered <= total
+  );
+  const soldCount = totalsCompatible ? total - rawUndiscovered : null;
+  const rawTotalAi = typeof result.totalAiCount === "number" ? result.totalAiCount : null;
+  const totalAi = (
+    total !== null
+    && rawTotalAi !== null
+    && rawTotalAi >= 0
+    && rawTotalAi <= total
+  ) ? rawTotalAi : null;
+  const rawUndiscoveredAi = typeof result.undiscoveredAiCount === "number"
+    ? result.undiscoveredAiCount
+    : null;
+  const aiTotalsCompatible = (
+    totalAi !== null
+    && rawUndiscoveredAi !== null
+    && rawUndiscoveredAi >= 0
+    && rawUndiscoveredAi <= totalAi
+    && (rawUndiscovered === null || rawUndiscoveredAi <= rawUndiscovered)
+  );
+  const soldAiCount = aiTotalsCompatible ? totalAi - rawUndiscoveredAi : null;
+  const aiShare = totalAi !== null && total !== null && total > 0
+    ? Math.round((totalAi / total) * 100)
+    : null;
+  const soldShare = soldCount !== null && total !== null && total > 0
+    ? Math.round((soldCount / total) * 100)
+    : null;
+  const soldAiShare = soldAiCount !== null && totalAi !== null && totalAi > 0
+    ? Math.round((soldAiCount / totalAi) * 100)
+    : null;
+
+  return (
+    <div className="space-y-0.5">
+      <p className={`text-sm font-semibold tabular-nums whitespace-nowrap ${demandColor(result.demand)}`}>
+        {formatNumber(result.demand)}
+      </p>
+      <p className="text-[10px] leading-snug text-text-muted tabular-nums whitespace-nowrap">
+        AI: {totalAi === null ? "unknown" : formatNumber(totalAi)} · {aiShare === null ? "—" : `${aiShare}%`}
+      </p>
+      <p className="text-[10px] leading-snug text-text-muted tabular-nums whitespace-nowrap">
+        С продажами: {soldCount === null ? "—" : formatNumber(soldCount)} · {soldShare === null ? "—" : `${soldShare}%`}
+      </p>
+      <p className="text-[10px] leading-snug text-text-muted tabular-nums whitespace-nowrap">
+        AI с продажами: {soldAiCount === null ? "unknown" : formatNumber(soldAiCount)} · {soldAiShare === null ? "—" : `${soldAiShare}%`}
+      </p>
+    </div>
+  );
+}
+
+function analyticsStatusLabel(status: AnalyticsStatus): string {
+  const labels: Record<AnalyticsStatus, string> = {
+    ok: "Полные данные",
+    partial: "Частичные данные",
+    pending: "В очереди",
+    not_scanned: "Не сканировалось",
+    scan_blocked: "Сканирование заблокировано",
+    waf_blocked: "Adobe остановил запросы",
+    parser_degraded: "Формат Adobe изменился",
+    calibration_missing: "Нет калибровки",
+    error: "Ошибка анализа",
+  };
+  return labels[status];
+}
+
+function formatNumber(value: number | null): string {
+  return value === null ? "—" : value.toLocaleString("en-US");
+}
+
+function demandColor(value: number | null): string {
+  if (value === null) return "text-text-muted";
+  if (value >= 100_000) return "text-success";
+  if (value >= 20_000) return "text-accent";
+  if (value >= 5_000) return "text-warning";
+  return "text-error";
+}
+
+function ActionButton({
+  kind,
+  title,
+  active,
+  loading,
+  allowActiveClick = false,
+  onClick,
+}: {
+  kind: "copy" | "heart";
+  title: string;
+  active: boolean;
+  loading?: boolean;
+  allowActiveClick?: boolean;
+  onClick: () => void;
+}) {
   return (
     <button
       type="button"
-      onClick={onClick}
       title={title}
-      className="p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-accent/10 transition-all duration-150 cursor-pointer"
+      disabled={loading || (kind === "heart" && active && !allowActiveClick)}
+      onClick={onClick}
+      className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all cursor-pointer ${
+        active ? "text-accent bg-accent/10" : "text-text-muted hover:text-accent hover:bg-accent/10"
+      } disabled:cursor-default`}
     >
-      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12Z" />
-      </svg>
+      {loading ? (
+        <span className="animate-spin">◌</span>
+      ) : kind === "copy" ? (
+        active ? "✓" : "⧉"
+      ) : (
+        <span className={active ? "text-accent" : ""}>{active ? "♥" : "♡"}</span>
+      )}
     </button>
   );
 }

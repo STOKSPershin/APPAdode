@@ -2,6 +2,10 @@
  * Header — Top navigation bar matching StockBooster design
  */
 export default function Header() {
+  const version = typeof chrome !== "undefined" && chrome.runtime?.getManifest
+    ? chrome.runtime.getManifest().version
+    : "1.4.3";
+
   return (
     <header className="w-full bg-bg-secondary/80 backdrop-blur-md border-b border-border sticky top-0 z-50">
       <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
@@ -28,7 +32,7 @@ export default function Header() {
             StockBooster Extension
           </span>
           <div className="w-px h-5 bg-border" />
-          <span className="text-xs font-medium text-text-secondary">v1.0.0</span>
+          <span className="text-xs font-medium text-text-secondary">v{version}</span>
         </div>
       </div>
     </header>

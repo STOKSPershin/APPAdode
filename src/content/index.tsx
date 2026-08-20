@@ -23,4 +23,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "TOGGLE_PANEL") {
     window.dispatchEvent(new CustomEvent("topichunter-toggle"));
   }
+  if (message.type === "RUN_SCAN_QUEUE") {
+    window.dispatchEvent(new CustomEvent("topichunter-run-queue"));
+  }
 });

@@ -1,26 +1,17 @@
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useState, useEffect } from "react";
 import {
-  AuthScreen,
+  CalibrationPanel,
   Header,
+  HistoryPanel,
+  PortfolioPanel,
   ResultsPlaceholder,
   ResultsTable,
   SavedItems,
+  ScanQueuePanel,
 } from "./components";
-import type { TopicResult } from "@shared/types";
-import { checkAndRevalidateSession } from "../../shared/api/auth";
-
-/** Shape of data saved by ContentApp to chrome.storage.local */
-interface ScanPayload {
-  userTopicResult: TopicResult;
-  results: TopicResult[];
-  warning: string | null;
-  topic: string;
-  timestamp: number;
-  model: string;
-  filters: string[];
-  minResults?: number;
-  maxResults?: number;
-}
+import type { ScanPayload, TopicResult } from "@shared/types";
+import { recalibrateTopicAnalytics } from "@shared/api/adobe-stock";
+import { findScanSession, getHistoryStats, getScanSession } from "@shared/api/history";
 
 const STORAGE_KEY = "latest_scan_results";
 
@@ -37,40 +28,50 @@ const STORAGE_KEY = "latest_scan_results";
  * 3. This component reads results from storage and displays them
  */
 export default function App() {
-  // ── Auth State ─────────────────────────────────────
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
-
   // ── Results State ──────────────────────────────────
   const [userTopicResult, setUserTopicResult] = useState<TopicResult | null>(null);
   const [results, setResults] = useState<TopicResult[]>([]);
   const [warning, setWarning] = useState<string | null>(null);
-  const [scanMeta, setScanMeta] = useState<{ topic: string; model: string; timestamp: number } | null>(null);
+  const [scanMeta, setScanMeta] = useState<{
+    topic: string;
+    model: string;
+    timestamp: number;
+    historySessionId?: string;
+  } | null>(null);
   const [hasData, setHasData] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<"scan" | "saved">("scan");
+  const [latestPayload, setLatestPayload] = useState<ScanPayload | null>(null);
+  const [viewingHistorical, setViewingHistorical] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [historyStats, setHistoryStats] = useState<{ sessions: number; topics: number } | null>(null);
+  const [activeTab, setActiveTab] = useState<"scan" | "saved" | "calibration" | "portfolio" | "queue" | "history">("scan");
 
-  // ── Check auth on mount & start 10min revalidation ──
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-
-    const verify = async () => {
-      try {
-        const isValid = await checkAndRevalidateSession();
-        setIsAuthenticated(isValid);
-      } catch {
-        setIsAuthenticated(false);
-      } finally {
-        setIsCheckingAuth(false);
-      }
-    };
-
-    verify();
-
-    // Re-validate every 10 minutes
-    interval = setInterval(verify, 10 * 60 * 1000);
-
-    return () => clearInterval(interval);
+  const displayScan = useCallback(async (payload: ScanPayload, historical: boolean) => {
+    const [recalibratedUserAnalytics, recalibratedResults] = await Promise.all([
+      payload.userTopicResult.analytics
+        ? recalibrateTopicAnalytics(payload.userTopicResult.analytics)
+        : Promise.resolve(undefined),
+      Promise.all(payload.results.map(async (result) => ({
+        ...result,
+        analytics: result.analytics
+          ? await recalibrateTopicAnalytics(result.analytics)
+          : undefined,
+      }))),
+    ]);
+    setUserTopicResult({
+      ...payload.userTopicResult,
+      analytics: recalibratedUserAnalytics,
+    });
+    setResults(recalibratedResults);
+    setWarning(payload.warning);
+    setScanMeta({
+      topic: payload.topic,
+      model: payload.model,
+      timestamp: payload.timestamp,
+      historySessionId: payload.historySessionId,
+    });
+    setHasData(true);
+    setViewingHistorical(historical);
   }, []);
 
   // ── Load scan results from chrome.storage ──────────
@@ -81,25 +82,9 @@ export default function App() {
           const data = await chrome.storage.local.get(STORAGE_KEY);
           const payload = data[STORAGE_KEY] as ScanPayload | undefined;
 
-          if (payload && payload.results && payload.results.length > 0) {
-            const min = payload.minResults ?? 0;
-            const max = payload.maxResults ?? Infinity;
-            
-            const filteredResults = payload.results.filter(r => {
-              if (r.status !== "ok") return true;
-              if (r.demand === null) return false;
-              return r.demand >= min && r.demand <= max;
-            });
-
-            setUserTopicResult(payload.userTopicResult);
-            setResults(filteredResults);
-            setWarning(payload.warning);
-            setScanMeta({
-              topic: payload.topic,
-              model: payload.model,
-              timestamp: payload.timestamp,
-            });
-            setHasData(true);
+          if (payload && payload.results && payload.userTopicResult) {
+            setLatestPayload(payload);
+            await displayScan(payload, false);
           }
         }
       } catch (err) {
@@ -110,44 +95,59 @@ export default function App() {
     };
 
     loadResults();
+  }, [displayScan]);
+
+  useEffect(() => {
+    getHistoryStats()
+      .then(setHistoryStats)
+      .catch(() => setHistoryStats(null));
   }, []);
 
   // ── Handlers ───────────────────────────────────────
-  const handleAuthenticated = useCallback((licenseKey: string) => {
-    console.log("[Dashboard] Authenticated:", licenseKey.slice(0, 4) + "...");
-    setIsAuthenticated(true);
-  }, []);
-
   const handleOpenAdobeStock = () => {
     window.open("https://stock.adobe.com", "_blank");
   };
 
-  // ── Loading State ──────────────────────────────────
-  if (isCheckingAuth) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-bg-primary">
-        <div className="flex flex-col items-center gap-3">
-          <svg className="w-8 h-8 text-accent animate-spin" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-          </svg>
-          <span className="text-sm text-text-muted">Загрузка...</span>
-        </div>
-      </div>
-    );
-  }
+  const handleOpenHistoryScan = async (request: {
+    sessionId?: string;
+    mainTopic: string;
+    nearTimestamp?: number;
+  }) => {
+    setIsLoading(true);
+    setHistoryError("");
+    try {
+      const payload = request.sessionId
+        ? await getScanSession(request.sessionId)
+        : await findScanSession(request.mainTopic, request.nearTimestamp);
+      if (!payload) {
+        throw new Error(`Не найден сохранённый скан темы «${request.mainTopic}»`);
+      }
+      await displayScan(payload, true);
+      setActiveTab("scan");
+    } catch (error: unknown) {
+      setHistoryError(error instanceof Error ? error.message : "Не удалось открыть сохранённый скан");
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
-  // ── Auth Screen ────────────────────────────────────
-  if (!isAuthenticated) {
-    return <AuthScreen onAuthenticated={handleAuthenticated} />;
-  }
+  const handleReturnToLatest = async () => {
+    if (!latestPayload) return;
+    setIsLoading(true);
+    setHistoryError("");
+    try {
+      await displayScan(latestPayload, false);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   // ── Dashboard ──────────────────────────────────────
   return (
     <div className="min-h-screen bg-bg-primary flex flex-col">
       <Header />
 
-      <main className="flex-1 w-full max-w-4xl mx-auto px-6 py-6 space-y-5">
+      <main className="flex-1 w-full max-w-[1600px] mx-auto px-6 py-6 space-y-5">
         
         {/* Tabs */}
         <div className="flex items-center gap-2 border-b border-border mb-6">
@@ -171,10 +171,65 @@ export default function App() {
           >
             Избранное
           </button>
+          <button
+            onClick={() => setActiveTab("calibration")}
+            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === "calibration"
+                ? "border-accent text-accent"
+                : "border-transparent text-text-muted hover:text-text-primary hover:border-border"
+            }`}
+          >
+            Калибровка дат
+          </button>
+          <button
+            onClick={() => setActiveTab("portfolio")}
+            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === "portfolio"
+                ? "border-accent text-accent"
+                : "border-transparent text-text-muted hover:text-text-primary hover:border-border"
+            }`}
+          >
+            Мои загрузки и продажи
+          </button>
+          <button
+            onClick={() => setActiveTab("queue")}
+            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === "queue"
+                ? "border-accent text-accent"
+                : "border-transparent text-text-muted hover:text-text-primary hover:border-border"
+            }`}
+          >
+            Очередь сканирования
+          </button>
+          <button
+            onClick={() => setActiveTab("history")}
+            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === "history"
+                ? "border-accent text-accent"
+                : "border-transparent text-text-muted hover:text-text-primary hover:border-border"
+            }`}
+          >
+            База тем
+          </button>
         </div>
 
-        {activeTab === "saved" ? (
-          <SavedItems />
+        {historyError && (
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-error/20 bg-error/8 px-5 py-3">
+            <p className="text-sm text-error">{historyError}</p>
+            <button type="button" onClick={() => setHistoryError("")} className="text-error cursor-pointer">×</button>
+          </div>
+        )}
+
+        {activeTab === "queue" ? (
+          <ScanQueuePanel />
+        ) : activeTab === "history" ? (
+          <HistoryPanel onOpenScan={(request) => void handleOpenHistoryScan(request)} />
+        ) : activeTab === "portfolio" ? (
+          <PortfolioPanel />
+        ) : activeTab === "calibration" ? (
+          <CalibrationPanel />
+        ) : activeTab === "saved" ? (
+          <SavedItems onOpenScan={(request) => void handleOpenHistoryScan(request)} />
         ) : (
           <>
             {/* Scan metadata banner */}
@@ -188,28 +243,45 @@ export default function App() {
               </div>
               <div>
                 <p className="text-sm font-medium text-text-primary">
-                  Последний скан: <span className="text-accent">{scanMeta.topic}</span>
+                  {viewingHistorical ? "Сохранённый скан" : "Последний скан"}: <span className="text-accent">{scanMeta.topic}</span>
                 </p>
                 <p className="text-xs text-text-muted">
                   {scanMeta.model} · {new Date(scanMeta.timestamp).toLocaleString("ru-RU")}
+                  {viewingHistorical && <span className="ml-2 rounded-md border border-accent/25 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-accent">История</span>}
                 </p>
+                {historyStats && (
+                  <p className="mt-0.5 text-[11px] text-text-muted">
+                    Локальная история: {historyStats.sessions} поисков · {historyStats.topics} снимков тем
+                  </p>
+                )}
               </div>
             </div>
-            <button
-              type="button"
-              onClick={handleOpenAdobeStock}
-              className="
-                px-4 py-2 rounded-xl text-sm font-medium
-                bg-accent text-white hover:bg-accent-hover
-                transition-all duration-200 cursor-pointer
-                flex items-center gap-2
-              "
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-              </svg>
-              Новый скан
-            </button>
+            <div className="flex items-center gap-2">
+              {viewingHistorical && latestPayload && (
+                <button
+                  type="button"
+                  onClick={() => void handleReturnToLatest()}
+                  className="rounded-xl border border-border bg-bg-input px-4 py-2 text-sm font-medium text-text-secondary cursor-pointer hover:border-border-hover hover:text-text-primary"
+                >
+                  Вернуться к последнему
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleOpenAdobeStock}
+                className="
+                  px-4 py-2 rounded-xl text-sm font-medium
+                  bg-accent text-white hover:bg-accent-hover
+                  transition-all duration-200 cursor-pointer
+                  flex items-center gap-2
+                "
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+                </svg>
+                Новый скан
+              </button>
+            </div>
           </div>
         )}
 
@@ -223,11 +295,14 @@ export default function App() {
           </div>
         ) : hasData ? (
           <ResultsTable
+            mainTopic={scanMeta?.topic ?? userTopicResult?.topic ?? ""}
             userTopicResult={userTopicResult}
             results={results}
             warning={warning}
             expectedCount={results.length}
             isGenerating={false}
+            scanSessionId={scanMeta?.historySessionId}
+            scanTimestamp={scanMeta?.timestamp}
           />
         ) : (
           <div className="space-y-4">
