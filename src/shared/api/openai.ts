@@ -40,6 +40,7 @@ export async function generateTopics(
   model: string,
   topic: string,
   systemPrompt?: string,
+  signal?: AbortSignal,
 ): Promise<GenerateTopicsResult> {
   const maxAttempts = 3;
   let lastError: Error | null = null;
@@ -52,6 +53,7 @@ export async function generateTopics(
 
       const response = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
         method: "POST",
+        signal,
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
@@ -110,6 +112,9 @@ export async function generateTopics(
         usage: data.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       };
     } catch (err) {
+      if (signal?.aborted) {
+        throw new Error("Сканирование остановлено вручную", { cause: err });
+      }
       lastError = err instanceof Error ? err : new Error(String(err));
       console.warn(`[OpenAI] ⚠️ Attempt ${attempt}/${maxAttempts} failed:`, lastError.message);
 

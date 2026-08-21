@@ -56,12 +56,27 @@ function normalizeQueue(value: unknown): MainTopicQueueState {
     delayMinMinutes,
     clampDelay(Number(candidate.delayMaxMinutes), base.delayMaxMinutes),
   );
+  const blockedWithoutBlockedItem = candidate.status === "blocked"
+    && !items.some((item) => item.status === "blocked");
+  const recoveredStatus = items.length === 0
+    ? "idle" as const
+    : items.some((item) => item.status === "pending")
+      ? "paused" as const
+      : items.every((item) => item.status === "completed")
+        ? "completed" as const
+        : "paused" as const;
 
   return {
     ...base,
     ...candidate,
     version: 1,
     items,
+    status: blockedWithoutBlockedItem ? recoveredStatus : candidate.status ?? base.status,
+    activeItemId: items.some((item) => item.id === candidate.activeItemId)
+      ? candidate.activeItemId ?? null
+      : null,
+    nextRunAt: blockedWithoutBlockedItem ? null : candidate.nextRunAt ?? null,
+    lastError: blockedWithoutBlockedItem ? null : candidate.lastError ?? null,
     delayMinMinutes,
     delayMaxMinutes,
     updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : base.updatedAt,
@@ -175,12 +190,56 @@ export function pauseMainTopicQueue(): Promise<MainTopicQueueState> {
   });
 }
 
+export function stopMainTopicQueueNow(): Promise<MainTopicQueueState> {
+  return withQueueLock(async () => {
+    const state = await readQueue();
+    const items = state.items.map((item) => item.status === "running"
+      ? {
+          ...item,
+          status: "pending" as const,
+          startedAt: null,
+          finishedAt: null,
+          error: null,
+          claimedBy: null,
+          leaseUntil: null,
+        }
+      : item);
+    return writeQueue({
+      ...state,
+      items,
+      status: "paused",
+      activeItemId: null,
+      nextRunAt: null,
+      lastError: null,
+    });
+  });
+}
+
 export function removeMainTopicQueueItem(itemId: string): Promise<MainTopicQueueState> {
   return withQueueLock(async () => {
     const state = await readQueue();
     const item = state.items.find((candidate) => candidate.id === itemId);
     if (item?.status === "running") return state;
-    return writeQueue({ ...state, items: state.items.filter((candidate) => candidate.id !== itemId) });
+    const items = state.items.filter((candidate) => candidate.id !== itemId);
+    const removedLastBlock = state.status === "blocked"
+      && !items.some((candidate) => candidate.status === "blocked");
+    const status = !removedLastBlock
+      ? state.status
+      : items.length === 0
+        ? "idle" as const
+        : items.some((candidate) => candidate.status === "pending")
+          ? "paused" as const
+          : items.every((candidate) => candidate.status === "completed")
+            ? "completed" as const
+            : "paused" as const;
+    return writeQueue({
+      ...state,
+      items,
+      status,
+      activeItemId: state.activeItemId === itemId ? null : state.activeItemId,
+      nextRunAt: removedLastBlock ? null : state.nextRunAt,
+      lastError: removedLastBlock ? null : state.lastError,
+    });
   });
 }
 
@@ -333,8 +392,10 @@ export function failMainTopicQueueItem(
 ): Promise<MainTopicQueueState> {
   return withQueueLock(async () => {
     const state = await readQueue();
+    const current = state.items.find((item) => item.id === itemId);
+    if (!current || current.claimedBy !== runnerId) return state;
     const items = state.items.map((item) => (
-      item.id === itemId && item.claimedBy === runnerId
+      item.id === itemId
         ? {
             ...item,
             status: "failed" as const,

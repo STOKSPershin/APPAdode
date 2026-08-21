@@ -1,7 +1,14 @@
-import type { OwnPortfolioAsset, OwnSaleEvent } from "@shared/types";
+import type {
+  AdobeSalesImport,
+  ImportedAdobeSale,
+  OwnPortfolioAsset,
+  OwnSaleEvent,
+} from "@shared/types";
+import { parseAdobeSalesCsv } from "./adobe-sales-csv";
 
 const ASSETS_KEY = "topicHunter_ownPortfolioAssets";
 const SALES_KEY = "topicHunter_ownSaleEvents";
+const ADOBE_SALES_IMPORT_KEY = "topicHunter_adobeSalesImportV1";
 
 let writeQueue: Promise<void> = Promise.resolve();
 
@@ -29,6 +36,33 @@ export async function getOwnSaleEvents(): Promise<OwnSaleEvent[]> {
     ? (data[SALES_KEY] as OwnSaleEvent[])
     : [];
   return [...sales].sort((left, right) => Date.parse(right.soldAt) - Date.parse(left.soldAt));
+}
+
+export async function getAdobeSalesImport(): Promise<AdobeSalesImport | null> {
+  const data = await chrome.storage.local.get(ADOBE_SALES_IMPORT_KEY);
+  const stored = data[ADOBE_SALES_IMPORT_KEY] as AdobeSalesImport | undefined;
+  if (!stored || stored.version !== 1 || !Array.isArray(stored.records)) return null;
+  return stored;
+}
+
+export async function importAdobeSalesCsv(
+  text: string,
+  sourceFileName: string,
+): Promise<AdobeSalesImport> {
+  const parsed = parseAdobeSalesCsv(text);
+  const importedAt = new Date().toISOString();
+  const records: ImportedAdobeSale[] = parsed.map((record) => ({
+    ...record,
+    id: `${record.assetId}:${record.soldAt}:${record.rowNumber}`,
+  }));
+  const value: AdobeSalesImport = {
+    version: 1,
+    importedAt,
+    sourceFileName: sourceFileName.trim() || "downloads.csv",
+    records,
+  };
+  await queuedWrite(() => chrome.storage.local.set({ [ADOBE_SALES_IMPORT_KEY]: value }));
+  return value;
 }
 
 export function saveOwnPortfolioAsset(input: {

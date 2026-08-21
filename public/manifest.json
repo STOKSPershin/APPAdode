@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "StockBooster — TopicHunter",
-  "version": "1.4.3",
+  "version": "1.6.2",
   "description": "Discover high-demand subtopics for Adobe Stock. AI-powered research with real-time demand validation.",
   "icons": {
     "16": "icons/icon16.png",

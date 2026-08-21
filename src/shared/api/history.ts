@@ -35,6 +35,10 @@ export function getScanSession(sessionId: string): Promise<ScanPayload | null> {
   return sendHistoryMessage<ScanPayload | null>({ type: "GET_SCAN_SESSION", sessionId });
 }
 
+export function deleteScanSession(sessionId: string): Promise<boolean> {
+  return sendHistoryMessage<boolean>({ type: "DELETE_SCAN_SESSION", sessionId });
+}
+
 export function findScanSession(
   mainTopic: string,
   nearTimestamp?: number,

@@ -1,12 +1,19 @@
-import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import { getSavedTopics, saveTopic } from "@shared/api/saved-items";
-import OpportunityDot from "./OpportunityDot";
+import { getAllTopicHistory } from "@shared/api/history";
+import {
+  buildTopicScorePool,
+  calculateTopicScore,
+  type TopicScore,
+} from "@shared/api/topic-score";
+import OpportunityScore from "./OpportunityScore";
 import ActivityCell from "./ActivityCell";
 import type {
   AgeWindowMetric,
   AnalyticsStatus,
   SavedItem,
   TopicAnalytics,
+  TopicHistoryEntry,
   TopicResult,
 } from "@shared/types";
 
@@ -32,6 +39,29 @@ interface DisplayRow {
   savedId?: string;
   mainTopicLabel?: string;
   savedItem?: SavedItem;
+  score: TopicScore | null;
+}
+
+type SavedSortKey =
+  | "topic"
+  | "demand"
+  | "score"
+  | "aiTop100"
+  | "age1"
+  | "age2"
+  | "age3"
+  | "age6"
+  | "dynamics"
+  | "activity"
+  | "verdict"
+  | "coverage"
+  | "titleMatches";
+
+type SortDirection = "desc" | "asc";
+
+interface SavedSortState {
+  key: SavedSortKey;
+  direction: SortDirection;
 }
 
 const SAVED_STORAGE_KEY = "topicHunter_savedTopics";
@@ -58,38 +88,71 @@ export default function ResultsTable({
   const [savedTopicKeys, setSavedTopicKeys] = useState<Set<string>>(() => new Set());
   const [saveError, setSaveError] = useState<string | null>(null);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [savedSort, setSavedSort] = useState<SavedSortState | null>(null);
+  const [historyEntries, setHistoryEntries] = useState<TopicHistoryEntry[]>([]);
 
   const savedMode = savedItems !== undefined;
-  const rows: DisplayRow[] = savedMode
-    ? savedItems.map((item, index) => ({
-      result: {
-        topic: item.subtopic,
-        demand: item.demand,
-        status: "ok" as const,
-        undiscoveredCount: item.undiscoveredCount,
-        totalAiCount: item.totalAiCount,
-        undiscoveredAiCount: item.undiscoveredAiCount,
-        activity: item.activity,
-        analytics: item.analytics,
-      },
-      key: `saved-${item.id}`,
-      source: false,
-      number: index + 1,
-      savedId: item.id,
-      mainTopicLabel: item.mainTopic,
-      savedItem: item,
-    }))
-    : [
-      ...(userTopicResult
-        ? [{ result: userTopicResult, key: "source-topic", source: true, number: null }]
-        : []),
-      ...results.map((result, index) => ({
-        result,
-        key: `result-${index}-${result.topic}`,
+  const rawRows = useMemo<Omit<DisplayRow, "score">[]>(() => (
+    savedMode
+      ? savedItems.map((item, index) => ({
+        result: {
+          topic: item.subtopic,
+          demand: item.demand,
+          status: "ok" as const,
+          undiscoveredCount: item.undiscoveredCount,
+          totalAiCount: item.totalAiCount,
+          undiscoveredAiCount: item.undiscoveredAiCount,
+          activity: item.activity,
+          analytics: item.analytics,
+        },
+        key: `saved-${item.id}`,
         source: false,
         number: index + 1,
-      })),
-    ];
+        savedId: item.id,
+        mainTopicLabel: item.mainTopic,
+        savedItem: item,
+      }))
+      : [
+        ...(userTopicResult
+          ? [{ result: userTopicResult, key: "source-topic", source: true, number: null }]
+          : []),
+        ...results.map((result, index) => ({
+          result,
+          key: `result-${index}-${result.topic}`,
+          source: false,
+          number: index + 1,
+        })),
+      ]
+  ), [results, savedItems, savedMode, userTopicResult]);
+  const scorePool = useMemo(() => {
+    const seenHistoricTopics = new Set<string>();
+    const latestHistoricResults = historyEntries.flatMap((entry) => {
+      const key = entry.topic.trim().toLocaleLowerCase();
+      if (!key || seenHistoricTopics.has(key)) return [];
+      seenHistoricTopics.add(key);
+      return [entry.result];
+    });
+    return buildTopicScorePool([
+      ...latestHistoricResults,
+      ...rawRows.map((row) => row.result),
+    ]);
+  }, [historyEntries, rawRows]);
+  const baseRows: DisplayRow[] = rawRows.map((row) => ({
+    ...row,
+    score: calculateTopicScore(row.result, scorePool),
+  }));
+  const rows = savedMode && savedSort
+    ? sortSavedRows(baseRows, savedSort).map((row, index) => ({ ...row, number: index + 1 }))
+    : baseRows;
+
+  const handleSavedSort = (key: SavedSortKey) => {
+    if (!savedMode) return;
+    setSavedSort((current) => {
+      if (!current || current.key !== key) return { key, direction: "desc" };
+      if (current.direction === "desc") return { key, direction: "asc" };
+      return null;
+    });
+  };
 
   useEffect(() => {
     let active = true;
@@ -123,6 +186,18 @@ export default function ResultsTable({
       chrome.storage?.onChanged?.removeListener(handleStorageChange);
     };
   }, [savedItems]);
+
+  useEffect(() => {
+    let active = true;
+    void getAllTopicHistory()
+      .then((entries) => {
+        if (active) setHistoryEntries(entries);
+      })
+      .catch(() => {
+        if (active) setHistoryEntries([]);
+      });
+    return () => { active = false; };
+  }, []);
 
   const isRowSaved = (row: DisplayRow): boolean => {
     if (savedMode) return true;
@@ -229,19 +304,25 @@ export default function ResultsTable({
           <thead>
             <tr>
               <StickyHeader className="left-0 w-12">#</StickyHeader>
-              <StickyHeader className="left-12 w-60 text-left">Тема</StickyHeader>
-              <StickyHeader className="left-72 w-52 text-right">Кол-во работ</StickyHeader>
-              <StickyHeader className="left-[496px] w-24">Действия</StickyHeader>
-              <HeaderCell>AI в top-100</HeaderCell>
-              <HeaderCell>≤ 1 мес.</HeaderCell>
-              <HeaderCell>≤ 2 мес.</HeaderCell>
-              <HeaderCell>≤ 3 мес.</HeaderCell>
-              <HeaderCell>≤ 6 мес.</HeaderCell>
-              <HeaderCell>Динамика</HeaderCell>
-              <HeaderCell>Активность 30д</HeaderCell>
-              <HeaderCell>Проходимость</HeaderCell>
-              <HeaderCell>Данные</HeaderCell>
-              <HeaderCell>Фраза в заголовке top-10</HeaderCell>
+              <StickyHeader className="left-12 w-60 text-left">
+                <SortHeaderLabel label="Тема" sortKey="topic" enabled={savedMode} state={savedSort} onSort={handleSavedSort} />
+              </StickyHeader>
+              <StickyHeader className="left-72 w-52 text-right">
+                <SortHeaderLabel label="Кол-во работ" sortKey="demand" enabled={savedMode} state={savedSort} onSort={handleSavedSort} align="right" />
+              </StickyHeader>
+              <StickyHeader className="left-[496px] w-24">
+                <SortHeaderLabel label="Действия" sortKey="score" enabled={savedMode} state={savedSort} onSort={handleSavedSort} />
+              </StickyHeader>
+              <HeaderCell><SortHeaderLabel label="AI в top-100" sortKey="aiTop100" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="≤ 1 мес." sortKey="age1" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="≤ 2 мес." sortKey="age2" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="≤ 3 мес." sortKey="age3" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="≤ 6 мес." sortKey="age6" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="Динамика" sortKey="dynamics" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="Активность 30д" sortKey="activity" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="Проходимость" sortKey="verdict" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="Данные" sortKey="coverage" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
+              <HeaderCell><SortHeaderLabel label="Фраза в заголовке top-10" sortKey="titleMatches" enabled={savedMode} state={savedSort} onSort={handleSavedSort} /></HeaderCell>
             </tr>
           </thead>
           <tbody>
@@ -302,7 +383,7 @@ export default function ResultsTable({
                         onClick={() => void handleSave(row)}
                       />
                     </div>
-                    <OpportunityDot analytics={row.result.analytics} />
+                    <OpportunityScore score={row.score} />
                   </div>
                 </StickyCell>
                   <AnalyticsCells result={row.result} />
@@ -325,7 +406,7 @@ export default function ResultsTable({
       </div>
 
       <p className="px-1 text-[11px] text-text-muted">
-        «С продажами» = общее число работ минус Undiscovered. Доля AI = AI-работы среди всех; продажи = доля работ с продажами среди всех; продажи AI = доля работ с продажами среди AI. «В top-10» показывает, сколько работ из указанного возрастного диапазона находится на первых десяти позициях. Активность 30д — proxy прироста работ с первой продажей; главное значение является нижней 95% границей Уилсона.
+        Оценка 0–100 сравнивает тему с последними снимками уникальных тем локальной базы; пунктирная рамка означает, что месячная динамика ещё накапливается. В избранном нажмите «Действия», чтобы сортировать по оценке. «С продажами» = общее число работ минус Undiscovered. Доля AI = AI-работы среди всех; продажи = доля работ с продажами среди всех; продажи AI = доля работ с продажами среди AI. «В top-10» показывает, сколько работ из указанного возрастного диапазона находится на первых десяти позициях. Активность 30д — proxy прироста работ с первой продажей; главное значение является нижней 95% границей Уилсона.
       </p>
     </div>
   );
@@ -499,7 +580,85 @@ function TitleMatchCell({ analytics }: { analytics: TopicAnalytics }) {
   );
 }
 
-function StickyHeader({ children, className }: { children: string; className: string }) {
+function sortSavedRows(rows: DisplayRow[], state: SavedSortState): DisplayRow[] {
+  return rows
+    .map((row, index) => ({ row, index, value: savedSortValue(row, state.key) }))
+    .sort((left, right) => {
+      if (left.value === null && right.value === null) return left.index - right.index;
+      if (left.value === null) return 1;
+      if (right.value === null) return -1;
+
+      const comparison = typeof left.value === "number" && typeof right.value === "number"
+        ? left.value - right.value
+        : String(left.value).localeCompare(String(right.value), "ru", {
+            sensitivity: "base",
+            numeric: true,
+          });
+      if (comparison === 0) return left.index - right.index;
+      return state.direction === "asc" ? comparison : -comparison;
+    })
+    .map(({ row }) => row);
+}
+
+function savedSortValue(row: DisplayRow, key: SavedSortKey): number | string | null {
+  const { result } = row;
+  const metrics = result.analytics?.metrics;
+  if (key === "topic") return result.topic.trim();
+  if (key === "demand") return result.demand;
+  if (key === "score") return row.score?.value ?? null;
+  if (key === "aiTop100") return metrics?.aiCount ?? null;
+  if (key === "dynamics") return metrics?.dynamics?.changed ?? null;
+  if (key === "activity") return result.activity?.overall?.wilsonLower30 ?? null;
+  if (key === "coverage") return result.analytics?.snapshot?.coverage.uniqueIdCoverage ?? null;
+  if (key === "titleMatches") return metrics?.titleMatchesTop10 ?? null;
+  if (key === "verdict") {
+    if (!metrics) return null;
+    return {
+      insufficient_data: 0,
+      frozen: 1,
+      no_fresh_ai: 2,
+      open: 3,
+    }[metrics.verdict];
+  }
+
+  const months = key === "age1" ? 1 : key === "age2" ? 2 : key === "age3" ? 3 : 6;
+  return metrics?.ageWindows.find((window) => window.months === months)?.total ?? null;
+}
+
+function SortHeaderLabel({
+  label,
+  sortKey,
+  enabled,
+  state,
+  onSort,
+  align = "left",
+}: {
+  label: string;
+  sortKey: SavedSortKey;
+  enabled: boolean;
+  state: SavedSortState | null;
+  onSort: (key: SavedSortKey) => void;
+  align?: "left" | "right";
+}) {
+  if (!enabled) return <>{label}</>;
+  const active = state?.key === sortKey;
+  const marker = active ? (state.direction === "desc" ? "↓" : "↑") : "↕";
+  return (
+    <button
+      type="button"
+      onClick={() => onSort(sortKey)}
+      title="Сортировать: больше → меньше, меньше → больше, сброс"
+      className={`group flex w-full items-center gap-1 bg-transparent p-0 font-inherit uppercase tracking-inherit text-inherit cursor-pointer ${align === "right" ? "justify-end" : "justify-start"}`}
+    >
+      <span>{label}</span>
+      <span className={`text-[10px] transition-opacity ${active ? "opacity-70" : "opacity-0 group-hover:opacity-25"}`} aria-hidden="true">
+        {marker}
+      </span>
+    </button>
+  );
+}
+
+function StickyHeader({ children, className }: { children: ReactNode; className: string }) {
   return (
     <th className={`sticky z-20 border-b border-border bg-bg-card px-3 py-3 text-xs font-medium uppercase tracking-wider text-text-muted whitespace-nowrap ${className}`}>
       {children}
@@ -507,7 +666,7 @@ function StickyHeader({ children, className }: { children: string; className: st
   );
 }
 
-function HeaderCell({ children }: { children: string }) {
+function HeaderCell({ children }: { children: ReactNode }) {
   return (
     <th className="border-b border-border bg-bg-card px-3 py-3 text-left text-xs font-medium uppercase tracking-wider text-text-muted whitespace-nowrap">
       {children}

@@ -1,7 +1,7 @@
 {
   "name": "topichunter-extension",
   "private": true,
-  "version": "1.4.3",
+  "version": "1.6.2",
   "type": "module",
   "description": "StockBooster TopicHunter — Chrome Extension (Manifest V3)",
   "scripts": {

@@ -1,5 +1,6 @@
 import { useCallback, useState, useEffect } from "react";
 import {
+  BackupPanel,
   CalibrationPanel,
   Header,
   HistoryPanel,
@@ -11,7 +12,12 @@ import {
 } from "./components";
 import type { ScanPayload, TopicResult } from "@shared/types";
 import { recalibrateTopicAnalytics } from "@shared/api/adobe-stock";
-import { findScanSession, getHistoryStats, getScanSession } from "@shared/api/history";
+import {
+  deleteScanSession,
+  findScanSession,
+  getHistoryStats,
+  getScanSession,
+} from "@shared/api/history";
 
 const STORAGE_KEY = "latest_scan_results";
 
@@ -44,7 +50,9 @@ export default function App() {
   const [viewingHistorical, setViewingHistorical] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const [historyStats, setHistoryStats] = useState<{ sessions: number; topics: number } | null>(null);
-  const [activeTab, setActiveTab] = useState<"scan" | "saved" | "calibration" | "portfolio" | "queue" | "history">("scan");
+  const [deleteConfirmSessionId, setDeleteConfirmSessionId] = useState<string | null>(null);
+  const [deletingHistory, setDeletingHistory] = useState(false);
+  const [activeTab, setActiveTab] = useState<"scan" | "saved" | "calibration" | "portfolio" | "queue" | "history" | "backup">("scan");
 
   const displayScan = useCallback(async (payload: ScanPayload, historical: boolean) => {
     const [recalibratedUserAnalytics, recalibratedResults] = await Promise.all([
@@ -115,6 +123,7 @@ export default function App() {
   }) => {
     setIsLoading(true);
     setHistoryError("");
+    setDeleteConfirmSessionId(null);
     try {
       const payload = request.sessionId
         ? await getScanSession(request.sessionId)
@@ -135,10 +144,49 @@ export default function App() {
     if (!latestPayload) return;
     setIsLoading(true);
     setHistoryError("");
+    setDeleteConfirmSessionId(null);
     try {
       await displayScan(latestPayload, false);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleDeleteHistoricalScan = async () => {
+    const sessionId = scanMeta?.historySessionId;
+    if (!viewingHistorical || !sessionId) return;
+
+    if (deleteConfirmSessionId !== sessionId) {
+      setDeleteConfirmSessionId(sessionId);
+      return;
+    }
+
+    setDeletingHistory(true);
+    setHistoryError("");
+    try {
+      await deleteScanSession(sessionId);
+      setHistoryStats(await getHistoryStats());
+      setDeleteConfirmSessionId(null);
+
+      if (latestPayload && latestPayload.historySessionId !== sessionId) {
+        await displayScan(latestPayload, false);
+        return;
+      }
+
+      if (latestPayload?.historySessionId === sessionId) {
+        await chrome.storage.local.remove(STORAGE_KEY);
+        setLatestPayload(null);
+      }
+      setUserTopicResult(null);
+      setResults([]);
+      setWarning(null);
+      setScanMeta(null);
+      setHasData(false);
+      setViewingHistorical(false);
+    } catch (error: unknown) {
+      setHistoryError(error instanceof Error ? error.message : "Не удалось удалить снимок");
+    } finally {
+      setDeletingHistory(false);
     }
   };
 
@@ -150,7 +198,7 @@ export default function App() {
       <main className="flex-1 w-full max-w-[1600px] mx-auto px-6 py-6 space-y-5">
         
         {/* Tabs */}
-        <div className="flex items-center gap-2 border-b border-border mb-6">
+        <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap border-b border-border mb-6">
           <button
             onClick={() => setActiveTab("scan")}
             className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
@@ -211,6 +259,16 @@ export default function App() {
           >
             База тем
           </button>
+          <button
+            onClick={() => setActiveTab("backup")}
+            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === "backup"
+                ? "border-accent text-accent"
+                : "border-transparent text-text-muted hover:text-text-primary hover:border-border"
+            }`}
+          >
+            Перенос базы
+          </button>
         </div>
 
         {historyError && (
@@ -222,6 +280,8 @@ export default function App() {
 
         {activeTab === "queue" ? (
           <ScanQueuePanel />
+        ) : activeTab === "backup" ? (
+          <BackupPanel />
         ) : activeTab === "history" ? (
           <HistoryPanel onOpenScan={(request) => void handleOpenHistoryScan(request)} />
         ) : activeTab === "portfolio" ? (
@@ -264,6 +324,21 @@ export default function App() {
                   className="rounded-xl border border-border bg-bg-input px-4 py-2 text-sm font-medium text-text-secondary cursor-pointer hover:border-border-hover hover:text-text-primary"
                 >
                   Вернуться к последнему
+                </button>
+              )}
+              {viewingHistorical && scanMeta.historySessionId && (
+                <button
+                  type="button"
+                  disabled={deletingHistory}
+                  onClick={() => void handleDeleteHistoricalScan()}
+                  className="rounded-xl border border-error/30 bg-error/8 px-4 py-2 text-sm font-medium text-error cursor-pointer hover:bg-error/12 disabled:cursor-wait disabled:opacity-50"
+                  title="Удалить только этот сохранённый снимок"
+                >
+                  {deletingHistory
+                    ? "Удаление…"
+                    : deleteConfirmSessionId === scanMeta.historySessionId
+                      ? "Подтвердить удаление"
+                      : "Удалить снимок"}
                 </button>
               )}
               <button

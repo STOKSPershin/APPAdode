@@ -19,12 +19,34 @@ import {
   claimNextMainTopic,
   failMainTopicQueueItem,
   finishMainTopicQueueItem,
+  getMainTopicQueue,
   renewMainTopicLease,
+  stopMainTopicQueueNow,
 } from "@shared/api/scan-queue";
 
 const DEFAULT_PROMPT = `Разбей тему '' на 10 конкретных, коммерческих подтем (visual concepts), которые покупатели ищут на стоках. Темы должны быть описательными и состоять из 1-3 слов. Верни ТОЛЬКО валидный JSON массив строк на английском языке (["topic1", "topic2"]).`;
 
 const STORAGE_KEY = "latest_scan_results";
+
+function waitBeforeNextAdobeStage(
+  minMs: number,
+  maxMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error("Сканирование остановлено вручную"));
+  const delay = Math.round(Math.random() * (maxMs - minMs) + minMs);
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", handleAbort);
+      resolve();
+    }, delay);
+    const handleAbort = () => {
+      window.clearTimeout(timer);
+      reject(new Error("Сканирование остановлено вручную"));
+    };
+    signal?.addEventListener("abort", handleAbort, { once: true });
+  });
+}
 
 interface ScanSettings {
   apiKey: string;
@@ -58,6 +80,7 @@ export default function ContentApp() {
   const queueRunnerActiveRef = useRef(false);
   const queueRunnerIdRef = useRef(crypto.randomUUID());
   const scanActiveRef = useRef(false);
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
 
   // Load settings
   useEffect(() => {
@@ -100,6 +123,9 @@ export default function ContentApp() {
     const t = scanTopic.trim();
     if (!t || !settings.apiKey.trim()) throw new Error("Не задана тема или OpenAI API ключ");
     scanActiveRef.current = true;
+    const scanController = new AbortController();
+    activeAbortControllerRef.current = scanController;
+    const { signal } = scanController;
     setTopic(t);
     const scanTimestamp = Date.now();
     setPhase("generating");
@@ -107,28 +133,68 @@ export default function ContentApp() {
     setProgress({ cur: 0, total: 0 });
 
     try {
-      const ai = await generateTopics(settings.apiKey, settings.model, t, settings.prompt);
+      const ai = await generateTopics(settings.apiKey, settings.model, t, settings.prompt, signal);
       setPhase("scraping");
       setProgress({ cur: 0, total: ai.topics.length + 1 });
 
-      const userResult = await scrapeAdobeStock(t, settings.filters);
+      const userResult = await scrapeAdobeStock(t, settings.filters, signal);
       setProgress((p) => ({ ...p, cur: 1 }));
 
       const marketCounterBlocked = (
         userResult.marketSalesStatus === "waf_blocked"
         || userResult.marketAiStatus === "waf_blocked"
       );
-      const rawResults = marketCounterBlocked
+      const savedItems = await getSavedTopics().catch(() => []);
+      const favoriteTopics = new Set(
+        savedItems.map((item) => item.subtopic.trim().toLocaleLowerCase()),
+      );
+
+      // The source topic is the most valuable part of the scan. Capture its
+      // top-100 before the long 4-counter sequence for every generated topic.
+      // This prevents the main snapshot from being the first request made
+      // after dozens of Adobe requests.
+      let mainAnalytics: Awaited<ReturnType<typeof analyzeTopicsWithDelay>> = new Map();
+      if (!marketCounterBlocked) {
+        await waitBeforeNextAdobeStage(3_500, 6_500, signal);
+        setPhase("analyzing");
+        setProgress({ cur: 0, total: 1 });
+        mainAnalytics = await analyzeTopicsWithDelay(
+          [t],
+          favoriteTopics,
+          ({ completed, total }) => setProgress({ cur: completed, total }),
+          true,
+          signal,
+        );
+      }
+      const sourceAnalytics = mainAnalytics.get(t.toLocaleLowerCase());
+      const sourceBlocked = Boolean(
+        sourceAnalytics
+        && ["waf_blocked", "parser_degraded", "scan_blocked"].includes(sourceAnalytics.status),
+      );
+      const stopBeforeSubtopics = marketCounterBlocked || sourceBlocked;
+
+      setPhase("scraping");
+      setProgress({ cur: 1, total: ai.topics.length + 1 });
+      if (!stopBeforeSubtopics) await waitBeforeNextAdobeStage(5_000, 9_000, signal);
+      const rawResults = stopBeforeSubtopics
         ? ai.topics.map((generatedTopic) => ({
-          topic: generatedTopic,
-          demand: null,
-          status: "waf_blocked" as const,
-          undiscoveredCount: null,
-          marketSalesStatus: "waf_blocked" as const,
-        }))
-        : await processTopicsWithDelay(ai.topics, settings.filters, (idx) => {
-          setProgress((p) => ({ ...p, cur: idx + 2 }));
-        });
+            topic: generatedTopic,
+            demand: null,
+            status: (marketCounterBlocked || sourceAnalytics?.status === "waf_blocked"
+              ? "waf_blocked"
+              : "error") as "waf_blocked" | "error",
+            undiscoveredCount: null,
+            marketSalesStatus: (marketCounterBlocked || sourceAnalytics?.status === "waf_blocked"
+              ? "waf_blocked"
+              : "error") as "waf_blocked" | "error",
+          }))
+        : await processTopicsWithDelay(
+            ai.topics,
+            settings.filters,
+            (idx) => setProgress((p) => ({ ...p, cur: idx + 2 })),
+            [4_000, 7_000],
+            signal,
+          );
 
       const activityResults = await enrichMarketActivities(
         [userResult, ...rawResults],
@@ -139,7 +205,9 @@ export default function ContentApp() {
 
       const warning = marketCounterBlocked
         ? "Adobe остановил один из рыночных счётчиков. Очередь подтем остановлена до следующего запуска."
-        : checkSanity(results);
+        : sourceBlocked
+          ? `Главный top-100 остановлен: ${sourceAnalytics?.error ?? "Adobe временно ограничил запросы"}. Подтемы не запрашивались.`
+          : checkSanity(results);
       const passingTopics = results
         .filter((result) => (
           result.status === "ok" &&
@@ -148,20 +216,18 @@ export default function ContentApp() {
           result.demand <= settings.maxResults
         ))
         .map((result) => result.topic);
-      const topicsForAnalytics = [t, ...passingTopics];
-      const savedItems = await getSavedTopics().catch(() => []);
-      const favoriteTopics = new Set(
-        savedItems.map((item) => item.subtopic.trim().toLocaleLowerCase()),
-      );
-
       setPhase("analyzing");
-      setProgress({ cur: 0, total: topicsForAnalytics.length });
-      const analyticsByTopic = await analyzeTopicsWithDelay(
-        topicsForAnalytics,
-        favoriteTopics,
-        ({ completed, total }) => setProgress({ cur: completed, total }),
-        true,
-      );
+      setProgress({ cur: 0, total: passingTopics.length });
+      const subtopicAnalytics = stopBeforeSubtopics
+        ? new Map()
+        : await analyzeTopicsWithDelay(
+            passingTopics,
+            favoriteTopics,
+            ({ completed, total }) => setProgress({ cur: completed, total }),
+            true,
+            signal,
+          );
+      const analyticsByTopic = new Map([...mainAnalytics, ...subtopicAnalytics]);
       const userTopicResult = {
         ...userResultWithActivity,
         analytics: analyticsByTopic.get(t.toLocaleLowerCase()),
@@ -208,6 +274,9 @@ export default function ContentApp() {
       throw err;
     } finally {
       scanActiveRef.current = false;
+      if (activeAbortControllerRef.current === scanController) {
+        activeAbortControllerRef.current = null;
+      }
     }
   }, []);
 
@@ -215,12 +284,43 @@ export default function ContentApp() {
     const t = topic.trim();
     if (!t || !apiKey.trim()) return;
     try {
+      const queueState = await getMainTopicQueue().catch(() => null);
+      if (
+        queueState
+        && (queueState.status === "running" || queueState.status === "blocked" || queueState.activeItemId)
+      ) {
+        const message = queueState.status === "blocked"
+          ? "Ручной скан не запущен: очередь уже остановлена Adobe. Подождите перед следующим запросом."
+          : "Ручной скан не запущен: работает очередь главных тем. Сначала поставьте её на паузу и дождитесь завершения текущей темы.";
+        setError(message);
+        setPhase("error");
+        return;
+      }
       await executeScan(t, { apiKey, model, filters, prompt, minResults, maxResults });
       window.dispatchEvent(new CustomEvent("topichunter-run-queue"));
     } catch {
       // executeScan already exposes the error in the panel.
     }
   }, [topic, apiKey, model, filters, prompt, minResults, maxResults, executeScan]);
+
+  const abortActiveScan = useCallback(() => {
+    if (!activeAbortControllerRef.current) return;
+    activeAbortControllerRef.current.abort();
+    setError("Сканирование остановлено вручную");
+    setPhase("error");
+    setProgress({ cur: 0, total: 0 });
+  }, []);
+
+  const handleStopActiveScan = useCallback(async () => {
+    abortActiveScan();
+    if (queueTopic) await stopMainTopicQueueNow().catch(() => undefined);
+  }, [abortActiveScan, queueTopic]);
+
+  useEffect(() => {
+    const handler = () => abortActiveScan();
+    window.addEventListener("topichunter-stop-scan", handler);
+    return () => window.removeEventListener("topichunter-stop-scan", handler);
+  }, [abortActiveScan]);
 
   const runMainTopicQueue = useCallback(async () => {
     if (queueRunnerActiveRef.current || scanActiveRef.current) return;
@@ -476,6 +576,15 @@ export default function ContentApp() {
             </>
           )}
         </button>
+        {working && (
+          <button
+            type="button"
+            onClick={() => void handleStopActiveScan()}
+            className="w-full rounded-xl border border-th-error/25 bg-th-error/8 py-2 text-[12px] font-medium text-th-error cursor-pointer hover:bg-th-error/12 transition-colors"
+          >
+            Остановить сканирование
+          </button>
+        )}
       </div>
     </div>
   );

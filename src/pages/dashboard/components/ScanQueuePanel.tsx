@@ -8,6 +8,7 @@ import {
   removeMainTopicQueueItem,
   retryMainTopicQueueItem,
   startMainTopicQueue,
+  stopMainTopicQueueNow,
 } from "@shared/api/scan-queue";
 import { getAllTopicHistory } from "@shared/api/history";
 import type {
@@ -82,6 +83,7 @@ export default function ScanQueuePanel() {
     const items = queue?.items ?? [];
     return {
       pending: items.filter((item) => item.status === "pending").length,
+      running: items.filter((item) => item.status === "running").length,
       completed: items.filter((item) => item.status === "completed").length,
       failed: items.filter((item) => item.status === "failed" || item.status === "blocked").length,
     };
@@ -158,15 +160,27 @@ export default function ScanQueuePanel() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {queue.status === "running" ? (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => void mutate(pauseMainTopicQueue)}
-              className="rounded-xl border border-warning/30 bg-warning/10 px-4 py-2 text-sm font-medium text-warning cursor-pointer disabled:opacity-50"
-            >
-              Пауза после текущей
-            </button>
+          {queue.status === "running" || counts.running > 0 ? (
+            <>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void mutate(stopMainTopicQueueNow)}
+                className="rounded-xl border border-error/30 bg-error/8 px-4 py-2 text-sm font-medium text-error cursor-pointer hover:bg-error/12 disabled:opacity-50"
+              >
+                Остановить сейчас
+              </button>
+              {queue.status === "running" && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void mutate(pauseMainTopicQueue)}
+                  className="rounded-xl border border-warning/30 bg-warning/10 px-4 py-2 text-sm font-medium text-warning cursor-pointer disabled:opacity-50"
+                >
+                  Пауза после текущей
+                </button>
+              )}
+            </>
           ) : (
             <button
               type="button"

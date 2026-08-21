@@ -12,7 +12,7 @@ const DB_VERSION = 2;
 const SESSION_STORE = "scanSessions";
 const TOPIC_STORE = "topicHistory";
 
-interface ScanSessionRecord {
+export interface ScanSessionRecord {
   id: string;
   timestamp: number;
   mainTopic: string;
@@ -24,7 +24,7 @@ interface ScanSessionRecord {
   topicCount: number;
 }
 
-interface TopicHistoryRecord {
+export interface TopicHistoryRecord {
   id: string;
   sessionId: string;
   topicKey: string;
@@ -35,6 +35,20 @@ interface TopicHistoryRecord {
   position?: number;
   result: TopicResult;
 }
+
+export interface HistoryDatabaseBackup {
+  version: 1;
+  sessions: ScanSessionRecord[];
+  topics: TopicHistoryRecord[];
+}
+
+export interface HistoryImportStats {
+  sessions: number;
+  topics: number;
+}
+
+const MAX_BACKUP_SESSIONS = 100_000;
+const MAX_BACKUP_TOPICS = 2_000_000;
 
 let databasePromise: Promise<IDBDatabase> | null = null;
 
@@ -203,6 +217,26 @@ export async function getScanSession(sessionId: string): Promise<ScanPayload | n
   };
 }
 
+export async function deleteScanSession(sessionId: string): Promise<boolean> {
+  if (!sessionId) return false;
+
+  const database = await openDatabase();
+  const transaction = database.transaction([SESSION_STORE, TOPIC_STORE], "readwrite");
+  transaction.objectStore(SESSION_STORE).delete(sessionId);
+
+  const sessionIndex = transaction.objectStore(TOPIC_STORE).index("sessionId");
+  const cursorRequest = sessionIndex.openCursor(IDBKeyRange.only(sessionId));
+  cursorRequest.onsuccess = () => {
+    const cursor = cursorRequest.result;
+    if (!cursor) return;
+    cursor.delete();
+    cursor.continue();
+  };
+
+  await transactionDone(transaction);
+  return true;
+}
+
 export async function findScanSession(
   mainTopic: string,
   nearTimestamp?: number,
@@ -358,4 +392,128 @@ export async function getHistoryStats(): Promise<{ sessions: number; topics: num
     requestResult(topicsRequest),
   ]);
   return { sessions, topics };
+}
+
+export async function exportHistoryDatabase(): Promise<HistoryDatabaseBackup> {
+  const database = await openDatabase();
+  const transaction = database.transaction([SESSION_STORE, TOPIC_STORE], "readonly");
+  const sessionsRequest = transaction.objectStore(SESSION_STORE).getAll();
+  const topicsRequest = transaction.objectStore(TOPIC_STORE).getAll();
+  const [sessions, topics] = await Promise.all([
+    requestResult(sessionsRequest) as Promise<ScanSessionRecord[]>,
+    requestResult(topicsRequest) as Promise<TopicHistoryRecord[]>,
+  ]);
+  await transactionDone(transaction);
+  return validateHistoryBackup({ version: 1, sessions, topics });
+}
+
+export async function replaceHistoryDatabase(value: unknown): Promise<HistoryImportStats> {
+  const backup = validateHistoryBackup(value);
+  const database = await openDatabase();
+  const transaction = database.transaction([SESSION_STORE, TOPIC_STORE], "readwrite");
+  const sessionStore = transaction.objectStore(SESSION_STORE);
+  const topicStore = transaction.objectStore(TOPIC_STORE);
+
+  sessionStore.clear();
+  topicStore.clear();
+  backup.sessions.forEach((record) => sessionStore.put(record));
+  backup.topics.forEach((record) => topicStore.put(record));
+
+  await transactionDone(transaction);
+  return { sessions: backup.sessions.length, topics: backup.topics.length };
+}
+
+function validateHistoryBackup(value: unknown): HistoryDatabaseBackup {
+  if (!isRecord(value) || value.version !== 1) {
+    throw new Error("Неподдерживаемая версия базы истории");
+  }
+  if (!Array.isArray(value.sessions) || !Array.isArray(value.topics)) {
+    throw new Error("В резервной копии отсутствует база истории");
+  }
+  if (value.sessions.length > MAX_BACKUP_SESSIONS || value.topics.length > MAX_BACKUP_TOPICS) {
+    throw new Error("Резервная копия превышает допустимый размер базы");
+  }
+
+  const sessionIds = new Set<string>();
+  for (const record of value.sessions) {
+    if (!isScanSessionRecord(record) || sessionIds.has(record.id)) {
+      throw new Error("Повреждена таблица сохранённых сканов");
+    }
+    sessionIds.add(record.id);
+  }
+
+  const topicIds = new Set<string>();
+  const topicCounts = new Map<string, number>();
+  const sourceCounts = new Map<string, number>();
+  for (const record of value.topics) {
+    if (
+      !isTopicHistoryRecord(record)
+      || topicIds.has(record.id)
+      || !sessionIds.has(record.sessionId)
+    ) {
+      throw new Error("Повреждена таблица истории тем");
+    }
+    topicIds.add(record.id);
+    topicCounts.set(record.sessionId, (topicCounts.get(record.sessionId) ?? 0) + 1);
+    if (record.isSource) {
+      sourceCounts.set(record.sessionId, (sourceCounts.get(record.sessionId) ?? 0) + 1);
+    }
+  }
+
+  for (const session of value.sessions) {
+    if (
+      topicCounts.get(session.id) !== session.topicCount
+      || sourceCounts.get(session.id) !== 1
+    ) {
+      throw new Error("Нарушена целостность сохранённого скана");
+    }
+  }
+
+  return value as unknown as HistoryDatabaseBackup;
+}
+
+function isScanSessionRecord(value: unknown): value is ScanSessionRecord {
+  if (!isRecord(value)) return false;
+  return (
+    isNonEmptyString(value.id)
+    && typeof value.timestamp === "number"
+    && Number.isFinite(value.timestamp)
+    && isNonEmptyString(value.mainTopic)
+    && typeof value.model === "string"
+    && Array.isArray(value.filters)
+    && value.filters.every((filter) => typeof filter === "string")
+    && typeof value.minResults === "number"
+    && Number.isFinite(value.minResults)
+    && typeof value.maxResults === "number"
+    && Number.isFinite(value.maxResults)
+    && (value.warning === null || typeof value.warning === "string")
+    && typeof value.topicCount === "number"
+    && Number.isSafeInteger(value.topicCount)
+    && value.topicCount >= 0
+  );
+}
+
+function isTopicHistoryRecord(value: unknown): value is TopicHistoryRecord {
+  if (!isRecord(value)) return false;
+  return (
+    isNonEmptyString(value.id)
+    && isNonEmptyString(value.sessionId)
+    && typeof value.topicKey === "string"
+    && isNonEmptyString(value.topic)
+    && (value.mainTopic === undefined || typeof value.mainTopic === "string")
+    && isNonEmptyString(value.checkedAt)
+    && Number.isFinite(Date.parse(value.checkedAt))
+    && typeof value.isSource === "boolean"
+    && (value.position === undefined || (typeof value.position === "number" && Number.isSafeInteger(value.position)))
+    && isRecord(value.result)
+    && typeof value.result.topic === "string"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }

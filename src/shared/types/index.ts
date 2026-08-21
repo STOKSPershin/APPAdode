@@ -346,6 +346,27 @@ export interface OwnSaleEvent {
   createdAt: string;
 }
 
+export interface ImportedAdobeSale {
+  id: string;
+  rowNumber: number;
+  soldAt: string;
+  assetId: string;
+  title: string;
+  licenseType: string;
+  revenue: number;
+  contentType: string;
+  fileName: string;
+  contributor: string;
+  size: string;
+}
+
+export interface AdobeSalesImport {
+  version: 1;
+  importedAt: string;
+  sourceFileName: string;
+  records: ImportedAdobeSale[];
+}
+
 // ── Extension Settings (chrome.storage) ────────────────────────────
 
 export interface ExtensionSettings {

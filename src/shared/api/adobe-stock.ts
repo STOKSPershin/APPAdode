@@ -93,9 +93,24 @@ function runSingleRequest<T>(operation: () => Promise<T>): Promise<T> {
   return result;
 }
 
-function waitRandom([min, max]: [number, number]): Promise<void> {
+function scanStoppedError(): Error {
+  return new Error("Сканирование остановлено вручную");
+}
+
+function waitRandom([min, max]: [number, number], signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(scanStoppedError());
   const delay = Math.round(Math.random() * (max - min) + min);
-  return new Promise((resolve) => setTimeout(resolve, delay));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", handleAbort);
+      resolve();
+    }, delay);
+    const handleAbort = () => {
+      clearTimeout(timer);
+      reject(scanStoppedError());
+    };
+    signal?.addEventListener("abort", handleAbort, { once: true });
+  });
 }
 
 function buildFilterParams(filters: ContentFilter[]): string {
@@ -148,11 +163,13 @@ function containsBlockPage(html: string): boolean {
   return /please enable js|доступ временно ограничен|access temporarily restricted/i.test(pageText);
 }
 
-async function fetchHtml(url: string): Promise<string> {
+async function fetchHtml(url: string, signal?: AbortSignal): Promise<string> {
   return runSingleRequest(async () => {
+    if (signal?.aborted) throw scanStoppedError();
     const response = await fetch(url, {
       method: "GET",
       credentials: "include",
+      signal,
       headers: {
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -625,7 +642,7 @@ export async function recalibrateTopicAnalytics(
   };
 }
 
-export async function analyzeTopicTop100(topic: string): Promise<TopicAnalytics> {
+export async function analyzeTopicTop100(topic: string, signal?: AbortSignal): Promise<TopicAnalytics> {
   const cleanTopic = topic.trim();
   if (!cleanTopic) return errorAnalytics(new AdobeScanError("error", "Пустая тема"));
   if (signedInAdobeSessionDetected()) {
@@ -650,7 +667,7 @@ export async function analyzeTopicTop100(topic: string): Promise<TopicAnalytics>
       };
     }
 
-    const mainHtml = await fetchHtml(buildPhotoSearchUrl(cleanTopic));
+    const mainHtml = await fetchHtml(buildPhotoSearchUrl(cleanTopic), signal);
     const mainPage = parseSearchPage(mainHtml, true);
     const assets: AssetObservation[] = mainPage.assets.map((asset) => {
       const estimate = estimateDateFromId(calibration, asset.assetId);
@@ -684,8 +701,8 @@ export async function analyzeTopicTop100(topic: string): Promise<TopicAnalytics>
       await checkParserBaseline(coverage);
     }
 
-    await waitRandom([1800, 3200]);
-    const firstUndiscoveredHtml = await fetchHtml(buildPhotoSearchUrl(cleanTopic, 1, true));
+    await waitRandom([1800, 3200], signal);
+    const firstUndiscoveredHtml = await fetchHtml(buildPhotoSearchUrl(cleanTopic, 1, true), signal);
     const firstUndiscovered = parseSearchPage(firstUndiscoveredHtml, false);
     const undiscoveredTotal = firstUndiscovered.totalResults;
     const undiscoveredIds = new Set(firstUndiscovered.assets.map((asset) => asset.assetId));
@@ -697,8 +714,8 @@ export async function analyzeTopicTop100(topic: string): Promise<TopicAnalytics>
       : 1;
 
     for (let page = 2; page <= pagesNeeded; page += 1) {
-      await waitRandom([1800, 3200]);
-      const html = await fetchHtml(buildPhotoSearchUrl(cleanTopic, page, true));
+      await waitRandom([1800, 3200], signal);
+      const html = await fetchHtml(buildPhotoSearchUrl(cleanTopic, page, true), signal);
       const parsed = parseSearchPage(html, false);
       for (const asset of parsed.assets) undiscoveredIds.add(asset.assetId);
       pagesScanned += 1;
@@ -752,6 +769,7 @@ export async function analyzeTopicTop100(topic: string): Promise<TopicAnalytics>
 
     return { status, confidence, snapshot, metrics };
   } catch (error) {
+    if (signal?.aborted) throw scanStoppedError();
     return errorAnalytics(error);
   }
 }
@@ -761,6 +779,7 @@ export async function analyzeTopicsWithDelay(
   favoriteTopics: Set<string>,
   progressCallback: AnalyticsProgressCallback,
   forceRefresh = false,
+  signal?: AbortSignal,
 ): Promise<Map<string, TopicAnalytics>> {
   const uniqueTopics = [...new Map(
     topics
@@ -782,7 +801,7 @@ export async function analyzeTopicsWithDelay(
       ? null
       : (await getLatestHistoricAnalytics(topic).catch(() => null))
         ?? (await getLatestStoredTopicAnalytics(topic));
-    const scanned = cached ?? await analyzeTopicTop100(topic);
+    const scanned = cached ?? await analyzeTopicTop100(topic, signal);
     const analytics = cached ? scanned : await attachDynamics(scanned, previous);
 
     result.set(normalized, analytics);
@@ -793,9 +812,18 @@ export async function analyzeTopicsWithDelay(
     }
 
     if (["waf_blocked", "parser_degraded", "scan_blocked"].includes(analytics.status)) {
+      const stoppedMessage = analytics.error
+        ?? `Сканирование остановлено на теме «${topic}»`;
+      for (const skippedTopic of uniqueTopics.slice(index + 1)) {
+        const skippedKey = skippedTopic.toLocaleLowerCase();
+        result.set(skippedKey, errorAnalytics(new AdobeScanError(
+          "scan_blocked",
+          `Top-100 не запрошен после остановки Adobe: ${stoppedMessage}`,
+        )));
+      }
       break;
     }
-    if (index + 1 < uniqueTopics.length) await waitRandom([2500, 4500]);
+    if (index + 1 < uniqueTopics.length) await waitRandom([2500, 4500], signal);
   }
 
   return result;
@@ -804,8 +832,9 @@ export async function analyzeTopicsWithDelay(
 export async function scrapeAdobeStock(
   keyword: string,
   filters: ContentFilter[] = ["photo"],
+  signal?: AbortSignal,
 ): Promise<TopicResult> {
-  const totalResult = await scrapeAdobeCount(keyword, filters, false);
+  const totalResult = await scrapeAdobeCount(keyword, filters, false, false, signal);
   if (totalResult.status !== "ok" || totalResult.demand === null) {
     return {
       ...totalResult,
@@ -817,8 +846,8 @@ export async function scrapeAdobeStock(
     };
   }
 
-  await waitRandom([900, 1600]);
-  const undiscoveredResult = await scrapeAdobeCount(keyword, filters, true);
+  await waitRandom([900, 1600], signal);
+  const undiscoveredResult = await scrapeAdobeCount(keyword, filters, true, false, signal);
   if (undiscoveredResult.status !== "ok" || undiscoveredResult.demand === null) {
     return {
       ...totalResult,
@@ -842,8 +871,8 @@ export async function scrapeAdobeStock(
     };
   }
 
-  await waitRandom([900, 1600]);
-  const totalAiResult = await scrapeAdobeCount(keyword, filters, false, true);
+  await waitRandom([900, 1600], signal);
+  const totalAiResult = await scrapeAdobeCount(keyword, filters, false, true, signal);
   if (totalAiResult.status !== "ok" || totalAiResult.demand === null) {
     return {
       ...totalResult,
@@ -855,8 +884,8 @@ export async function scrapeAdobeStock(
     };
   }
 
-  await waitRandom([900, 1600]);
-  const undiscoveredAiResult = await scrapeAdobeCount(keyword, filters, true, true);
+  await waitRandom([900, 1600], signal);
+  const undiscoveredAiResult = await scrapeAdobeCount(keyword, filters, true, true, signal);
   if (undiscoveredAiResult.status !== "ok" || undiscoveredAiResult.demand === null) {
     return {
       ...totalResult,
@@ -888,8 +917,10 @@ async function scrapeAdobeCount(
   filters: ContentFilter[],
   undiscovered: boolean,
   gentechOnly = false,
+  signal?: AbortSignal,
 ): Promise<TopicResult> {
   try {
+    if (signal?.aborted) throw scanStoppedError();
     const filterParams = buildFilterParams(filters);
     const encodedKeyword = encodeURIComponent(keyword);
     const undiscoveredParam = undiscovered ? "&filters[undiscovered]=only" : "";
@@ -901,6 +932,7 @@ async function scrapeAdobeCount(
         {
           method: "GET",
           credentials: "include",
+          signal,
           headers: {
             Accept: "application/json, text/javascript, */*; q=0.01",
             "Accept-Language": "en-US,en;q=0.9",
@@ -927,8 +959,9 @@ async function scrapeAdobeCount(
       // The HTML fallback below is deliberately kept for format changes.
     }
 
-    return await scrapeHtmlFallback(keyword, filters, undiscovered, gentechOnly);
+    return await scrapeHtmlFallback(keyword, filters, undiscovered, gentechOnly, signal);
   } catch (error) {
+    if (signal?.aborted) throw scanStoppedError();
     const message = error instanceof Error ? error.message : String(error);
     const isBlocked = /403|429|datadome|failed to fetch|networkerror/i.test(message);
     return { topic: keyword, demand: null, status: isBlocked ? "waf_blocked" : "error" };
@@ -940,6 +973,7 @@ async function scrapeHtmlFallback(
   filters: ContentFilter[],
   undiscovered: boolean,
   gentechOnly: boolean,
+  signal?: AbortSignal,
 ): Promise<TopicResult> {
   try {
     const filterParams = buildFilterParams(filters);
@@ -947,6 +981,7 @@ async function scrapeHtmlFallback(
     const gentechParam = gentechOnly ? "&filters[gentech]=only" : "";
     const html = await fetchHtml(
       `${ADOBE_STOCK_BASE}/search?k=${encodeURIComponent(keyword)}&${filterParams}${undiscoveredParam}${gentechParam}`,
+      signal,
     );
     const documentValue = new DOMParser().parseFromString(html, "text/html");
     const total = parseResultCount(documentValue);
@@ -954,6 +989,7 @@ async function scrapeHtmlFallback(
       ? { topic: keyword, demand: null, status: "error" }
       : { topic: keyword, demand: total, status: "ok" };
   } catch (error) {
+    if (signal?.aborted) throw scanStoppedError();
     return {
       topic: keyword,
       demand: null,
@@ -974,12 +1010,14 @@ export async function processTopicsWithDelay(
   topics: string[],
   filters: ContentFilter[],
   progressCallback: ProgressCallback,
-  delayMs: [number, number] = [1800, 3200],
+  delayMs: [number, number] = [4000, 7000],
+  signal?: AbortSignal,
 ): Promise<TopicResult[]> {
   const results: TopicResult[] = [];
 
   for (let index = 0; index < topics.length; index += 1) {
-    const result = await scrapeAdobeStock(topics[index], filters);
+    if (signal?.aborted) throw scanStoppedError();
+    const result = await scrapeAdobeStock(topics[index], filters, signal);
     results.push(result);
     progressCallback(index, result, topics.length);
 
@@ -988,7 +1026,12 @@ export async function processTopicsWithDelay(
       || result.marketSalesStatus === "waf_blocked"
       || result.marketAiStatus === "waf_blocked"
     ) break;
-    if (index + 1 < topics.length) await waitRandom(delayMs);
+    if (index + 1 < topics.length) {
+      // Each topic already contains up to four counter requests. Give Adobe a
+      // longer breather after every fifth topic instead of sustaining one
+      // dense request burst through the whole generated list.
+      await waitRandom((index + 1) % 5 === 0 ? [20_000, 35_000] : delayMs, signal);
+    }
   }
 
   return results;

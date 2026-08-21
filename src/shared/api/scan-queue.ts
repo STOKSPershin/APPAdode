@@ -49,6 +49,10 @@ export function pauseMainTopicQueue(): Promise<MainTopicQueueState> {
   return sendQueueMessage<MainTopicQueueState>({ type: "PAUSE_MAIN_TOPIC_QUEUE" });
 }
 
+export function stopMainTopicQueueNow(): Promise<MainTopicQueueState> {
+  return sendQueueMessage<MainTopicQueueState>({ type: "STOP_MAIN_TOPIC_QUEUE_NOW" });
+}
+
 export function removeMainTopicQueueItem(itemId: string): Promise<MainTopicQueueState> {
   return sendQueueMessage<MainTopicQueueState>({ type: "REMOVE_MAIN_TOPIC_QUEUE_ITEM", itemId });
 }

@@ -7,6 +7,7 @@
  */
 
 import {
+  deleteScanSession,
   findScanSession,
   getActivityPool,
   getAllTopicHistory,
@@ -29,6 +30,7 @@ import {
   renewMainTopicLease,
   retryMainTopicQueueItem,
   startMainTopicQueue,
+  stopMainTopicQueueNow,
 } from "./scan-queue";
 import type { MainTopicQueueState, ScanPayload } from "@shared/types";
 
@@ -89,6 +91,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         .catch((error: unknown) => sendResponse({ error: errorMessage(error) }));
       return true;
 
+    case "DELETE_SCAN_SESSION":
+      deleteScanSession(String(message.sessionId ?? ""))
+        .then((deleted) => sendResponse({ data: deleted }))
+        .catch((error: unknown) => sendResponse({ error: errorMessage(error) }));
+      return true;
+
     case "FIND_SCAN_SESSION":
       findScanSession(
         String(message.mainTopic ?? ""),
@@ -131,6 +139,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         .catch((error: unknown) => sendResponse({ error: errorMessage(error) }));
       return true;
 
+    case "SUSPEND_FOR_BACKUP_IMPORT":
+      suspendForBackupImport()
+        .then(() => sendResponse({ data: true }))
+        .catch((error: unknown) => sendResponse({ error: errorMessage(error) }));
+      return true;
+
+    case "REFRESH_MAIN_TOPIC_QUEUE_SCHEDULE":
+      getMainTopicQueue()
+        .then(async (state) => {
+          await scheduleQueueWakeup(state);
+          sendResponse({ data: state });
+        })
+        .catch((error: unknown) => sendResponse({ error: errorMessage(error) }));
+      return true;
+
     case "GET_MAIN_TOPIC_QUEUE":
       getMainTopicQueue()
         .then((state) => sendResponse({ data: state }))
@@ -160,6 +183,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     case "PAUSE_MAIN_TOPIC_QUEUE":
       updateQueueAndSchedule(pauseMainTopicQueue())
+        .then((state) => sendResponse({ data: state }))
+        .catch((error: unknown) => sendResponse({ error: errorMessage(error) }));
+      return true;
+
+    case "STOP_MAIN_TOPIC_QUEUE_NOW":
+      stopQueueAndActiveScans()
         .then((state) => sendResponse({ data: state }))
         .catch((error: unknown) => sendResponse({ error: errorMessage(error) }));
       return true;
@@ -253,6 +282,27 @@ async function wakeQueueRunner(): Promise<void> {
     // Tabs opened before an extension reload have no current content script.
     await chrome.tabs.reload(target.id);
   }
+}
+
+async function stopQueueAndActiveScans(): Promise<MainTopicQueueState> {
+  const state = await updateQueueAndSchedule(stopMainTopicQueueNow());
+  const tabs = await chrome.tabs.query({ url: "https://stock.adobe.com/*" });
+  await Promise.allSettled(tabs.map((tab) => (
+    typeof tab.id === "number"
+      ? chrome.tabs.sendMessage(tab.id, { type: "STOP_ACTIVE_SCAN" })
+      : Promise.resolve()
+  )));
+  return state;
+}
+
+async function suspendForBackupImport(): Promise<void> {
+  await chrome.alarms.clear(QUEUE_ALARM);
+  const tabs = await chrome.tabs.query({ url: "https://stock.adobe.com/*" });
+  await Promise.allSettled(tabs.map((tab) => (
+    typeof tab.id === "number"
+      ? chrome.tabs.sendMessage(tab.id, { type: "STOP_ACTIVE_SCAN" })
+      : Promise.resolve()
+  )));
 }
 
 async function scheduleQueueWakeup(state: MainTopicQueueState): Promise<void> {

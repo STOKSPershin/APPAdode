@@ -26,4 +26,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "RUN_SCAN_QUEUE") {
     window.dispatchEvent(new CustomEvent("topichunter-run-queue"));
   }
+  if (message.type === "STOP_ACTIVE_SCAN") {
+    window.dispatchEvent(new CustomEvent("topichunter-stop-scan"));
+  }
 });

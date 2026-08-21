@@ -9,3 +9,4 @@ export { default as PortfolioPanel } from "./PortfolioPanel";
 export { default as ActivityCell } from "./ActivityCell";
 export { default as HistoryPanel } from "./HistoryPanel";
 export { default as ScanQueuePanel } from "./ScanQueuePanel";
+export { default as BackupPanel } from "./BackupPanel";

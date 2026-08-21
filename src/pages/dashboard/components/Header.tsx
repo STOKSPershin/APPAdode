@@ -4,7 +4,7 @@
 export default function Header() {
   const version = typeof chrome !== "undefined" && chrome.runtime?.getManifest
     ? chrome.runtime.getManifest().version
-    : "1.4.3";
+    : "1.5.0";
 
   return (
     <header className="w-full bg-bg-secondary/80 backdrop-blur-md border-b border-border sticky top-0 z-50">
